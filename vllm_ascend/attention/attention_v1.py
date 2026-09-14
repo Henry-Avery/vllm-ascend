@@ -21,6 +21,7 @@ from typing import Any
 
 import torch
 import torch_npu
+import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.utils.math_utils import cdiv
@@ -41,12 +42,15 @@ from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
+from vllm_ascend.attention.flash_mla import (
+    FlashMLAContract,
+    flash_mla_with_kvcache_metadata,
+)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     PagedAttentionGraphParam,
     cache_graph_workspace,
     enable_dcp,
-    enable_pcp,
     needs_layer_aware_fia_graph_replay,
     notify_kv_cache_written,
     split_decodes_and_prefills,
@@ -61,10 +65,12 @@ from vllm_ascend.compilation.acl_graph import (
     update_graph_params_workspaces,
 )
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
-from vllm_ascend.utils import is_950, vllm_version_is, weak_ref_tensors
+from vllm_ascend.utils import vllm_version_is, weak_ref_tensors
+from vllm_ascend.worker.device_metadata import DeviceMetadataStage, DeviceMetadataTask
 
-if vllm_version_is("0.27.1"):
+if vllm_version_is("0.28.0"):
     from vllm.model_executor.layers.attention.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
 else:
     from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
@@ -72,6 +78,157 @@ else:
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
 _ATTN_KEYS_BUFFER = None
+
+
+# FLASHMLA[REF-16468]: MLA subset of the reference's shared FA/MLA buffers.
+# Only AscendMLAMetadataBuilder uses these helpers in this draft; the generic
+# AscendAttentionBackend below still follows its existing attention path.
+@dataclass
+class AscendFlashAttentionMetadata:
+    """Persistent device buffers consumed by the external FlashMLA package."""
+
+    query: torch.Tensor
+    schedule: torch.Tensor
+    cu: torch.Tensor
+    used_q: torch.Tensor
+    cache_lens: torch.Tensor
+    block_table: torch.Tensor
+    slots: torch.Tensor
+    live_boundaries: torch.Tensor
+    token_live: torch.Tensor
+    positions: torch.Tensor
+    attn_mask: torch.Tensor
+    max_query_len: int
+    max_seq_len: int
+    is_prefill: bool
+    contract: FlashMLAContract
+
+
+def _init_flash_attention_metadata(builder, impl) -> None:
+    """Allocate FlashMLA state only after the worker selected an NPU."""
+    builder.flash_num_heads = impl.num_heads
+    builder._flash_buffers = {}
+    builder._flash_attn_mask = torch.triu(
+        torch.ones((2048, 2048), dtype=torch.int8, device=builder.device), diagonal=1
+    )
+
+
+def _build_flash_attention_metadata(builder, common) -> AscendFlashAttentionMetadata:
+    """Refresh batch-dependent FlashMLA inputs on the metadata stream.
+
+    The final zero-used row owns graph and sequence-parallel padding. Its
+    stable storage lets ACL Graph replay observe unchanged tensor addresses.
+    """
+    batch = common.num_reqs
+    tokens = max(common.num_actual_tokens, common.num_input_tokens)
+    table = common.block_table_tensor[:batch]
+    # FLASHMLA[REF-16468]: cache allocations by batch/token/table capacity.
+    # Contents (including physical block IDs) are refreshed on every step;
+    # stable addresses let captured attention consume the updated inputs.
+    key = batch, tokens, table.shape[1]
+    if key not in builder._flash_buffers:
+        # The extra row owns padded tokens, with seqused_q=cache_seqlens=0.
+        rows = batch + 1
+        int_args = {"dtype": torch.int32, "device": builder.device}
+        float_args = {"dtype": builder.kv_cache_spec.dtype, "device": builder.device}
+        # FLASHMLA[EXTERNAL]: retained A5 capacity formula from #16468.
+        # This allocates storage, not a synthetic schedule: the real metadata
+        # op generates its contents. The package result is checked below.
+        words = ((36 + 72) * rows + 1) * 16
+        words = ((words + 4095) // 4096) * 4096
+        block_size = getattr(builder, "kernel_block_size", None) or builder.kv_cache_spec.block_size
+        builder._flash_buffers[key] = AscendFlashAttentionMetadata(
+            query=torch.empty((tokens, builder.flash_num_heads, 576), **float_args),
+            schedule=torch.empty(words, **int_args),
+            cu=torch.zeros(rows + 1, **int_args),
+            used_q=torch.zeros(rows, **int_args),
+            cache_lens=torch.zeros(rows, **int_args),
+            block_table=torch.zeros((rows, table.shape[1]), **int_args),
+            slots=torch.full((tokens,), -1, dtype=torch.int64, device=builder.device),
+            live_boundaries=torch.zeros(tokens + 1, **int_args),
+            token_live=torch.zeros(tokens, dtype=torch.bool, device=builder.device),
+            positions=torch.zeros(tokens, dtype=torch.int64, device=builder.device),
+            attn_mask=builder._flash_attn_mask,
+            # Capacity bounds remain fixed for graph replay. Actual request
+            # lengths are carried by cu/used_q/cache_lens in token units.
+            max_query_len=tokens,
+            max_seq_len=table.shape[1] * block_size,
+            is_prefill=common.max_query_len > builder.decode_threshold,
+            contract=FlashMLAContract(
+                num_heads_q=builder.flash_num_heads,
+                max_seqlen_q=tokens,
+                max_seqlen_kv=table.shape[1] * block_size,
+            ),
+        )
+    flash = builder._flash_buffers[key]
+    flash.is_prefill = common.max_query_len > builder.decode_threshold
+    # FLASHMLA[ABI]: both operators receive this exact scalar/layout contract.
+    # The tensors are refreshed below, but the contract is rebuilt per batch so
+    # causal and capacity changes cannot leave a stale tiling description.
+    flash.contract = FlashMLAContract(
+        num_heads_q=builder.flash_num_heads,
+        max_seqlen_q=flash.max_query_len,
+        max_seqlen_kv=flash.max_seq_len,
+        mask_mode=3 if common.causal else 0,
+    )
+
+    def build_metadata() -> None:
+        # FLASHMLA[REF-16468]: read current device tensors when the executor
+        # submits this closure, after asynchronous acceptance corrections.
+        # cu is cumulative; used_q/cache_lens are per-request token counts.
+        flash.cu[: batch + 1].copy_(common.query_start_loc[: batch + 1])
+        flash.cu[batch + 1].fill_(tokens)
+        flash.used_q[:batch].copy_(flash.cu[1 : batch + 1] - flash.cu[:batch])
+        flash.used_q[:batch].masked_fill_(common.seq_lens[:batch] <= 0, 0)
+        flash.used_q[batch:].zero_()
+        flash.cache_lens[:batch].copy_(common.seq_lens[:batch])
+        flash.cache_lens[batch:].zero_()
+        flash.block_table[:batch].copy_(table)
+        flash.block_table[batch:].zero_()
+        flash.slots.fill_(-1)
+        slots = common.slot_mapping[:tokens]
+        flash.slots[:slots.shape[0]].copy_(slots)
+        # Mark live query intervals with a prefix sum. Setting inactive slots
+        # to -1 prevents graph/request padding from writing into real KV pages.
+        flash.live_boundaries.zero_()
+        live_rows = (flash.used_q > 0).to(torch.int32)
+        flash.live_boundaries.scatter_add_(0, flash.cu[:-1].long(), live_rows)
+        flash.live_boundaries.scatter_add_(
+            0, (flash.cu[:-1] + flash.used_q).long(), -live_rows
+        )
+        flash.token_live.copy_(flash.live_boundaries.cumsum(0)[:tokens] > 0)
+        flash.slots.masked_fill_(~flash.token_live, -1)
+        flash.positions.zero_()
+        positions = common.positions[:tokens]
+        flash.positions[:positions.shape[0]].copy_(positions)
+        # FLASHMLA[EXTERNAL]: replace #16468's _C_ascend metadata dispatcher.
+        # Heads, lengths, dimensions, mask_mode and layout_q come from the
+        # same contract later consumed by _forward_flash.
+        metadata = flash_mla_with_kvcache_metadata(
+            flash.cache_lens,
+            flash.contract.num_heads_q,
+            flash.contract.num_heads_kv,
+            **flash.contract.metadata_kwargs(flash.cu, flash.used_q),
+        )
+        if metadata.dtype != torch.int32 or metadata.numel() != flash.schedule.numel():
+            raise RuntimeError(
+                "External FlashMLA metadata ABI does not match the persistent "
+                f"schedule buffer: expected {flash.schedule.numel()} int32 words, "
+                f"got {metadata.numel()} {metadata.dtype} words."
+            )
+        # Preserve the schedule address captured by the main attention op.
+        # copy_ transfers the real producer output on the metadata stream.
+        flash.schedule.copy_(metadata)
+
+    if builder._device_metadata_enabled:
+        # FLASHMLA[REF-16468]: the existing worker executor owns the stream,
+        # events and reuse fence. _forward_flash waits on this same group ID.
+        builder._device_metadata_tasks = (
+            DeviceMetadataTask(DeviceMetadataStage.ATTENTION, build_metadata, id(flash.schedule)),
+        )
+    else:
+        build_metadata()
+    return flash
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -84,13 +241,7 @@ class AscendAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> type["AscendAttentionBackendImpl"]:
-        pcp_enabled = enable_pcp()
-        dcp_enabled = enable_dcp()
-        if pcp_enabled and dcp_enabled:
-            raise NotImplementedError("Ascend MRV2 GQA does not support PCP and DCP simultaneously yet.")
-        if pcp_enabled:
-            return AscendAttentionPCPImpl
-        if dcp_enabled:
+        if enable_dcp():
             from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionDCPImpl
 
             return AscendAttentionDCPImpl
@@ -98,17 +249,18 @@ class AscendAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type["AscendAttentionMetadataBuilder"]:
-        pcp_enabled = enable_pcp()
-        dcp_enabled = enable_dcp()
-        if pcp_enabled and dcp_enabled:
-            raise NotImplementedError("Ascend MRV2 GQA does not support PCP and DCP simultaneously yet.")
-        if pcp_enabled:
-            return AscendAttentionPCPMetadataBuilder
-        if dcp_enabled:
+        if enable_dcp():
             from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionDCPMetadataBuilder
 
             return AscendAttentionDCPMetadataBuilder
         return AscendAttentionMetadataBuilder
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        # vLLM checks this capability before any instance-level PCP dispatch.
+        # Only the main GQA implementation owns the PCP path; exact identity
+        # prevents backends such as 310P from inheriting unsupported capability.
+        return cls.get_impl_cls() is AscendAttentionBackendImpl
 
     @staticmethod
     def get_kv_cache_shape(
@@ -214,12 +366,7 @@ class AscendMetadata:
     # prefill reshape_and_cache event
     reshape_cache_event: torch.npu.Event = None
 
-
-@dataclass
-class AscendAttentionPCPMetadata(AscendMetadata):
-    """GQA metadata needed to write the complete PCP KV cache."""
-
-    pcp_local_num_input_tokens: int = 0
+    pcp_local_num_input_tokens: int | None = None
 
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
@@ -245,6 +392,8 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.vllm_config = vllm_config
+        self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+        self.pcp_enabled = self.pcp_size > 1
         self.model_config = vllm_config.model_config
         self.compilation_config = vllm_config.compilation_config
         self.device = device
@@ -289,6 +438,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         return split_decodes_and_prefills(
             common_attn_metadata,
             decode_threshold=self.decode_threshold,
+            treat_short_extends_as_decodes=not self.pcp_enabled,
         )
 
     def _build_backend_metadata(
@@ -315,6 +465,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         common_attn_metadata: AscendCommonAttentionMetadata,
         fast_build: bool = False,
     ) -> AscendMetadata:
+        expanded_slot_mapping = common_attn_metadata.slot_mapping if self.pcp_enabled else None
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
@@ -413,7 +564,33 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             model_runner_type=self.model_config.runner_type,
             **backend_metadata,
         )
+        if self.pcp_enabled:
+            assert expanded_slot_mapping is not None
+            self._finalize_pcp_metadata(attn_metadata, expanded_slot_mapping)
         return attn_metadata
+
+    def _finalize_pcp_metadata(
+        self,
+        metadata: AscendMetadata,
+        expanded_slot_mapping: torch.Tensor,
+    ) -> None:
+        if expanded_slot_mapping.numel() % self.pcp_size != 0:
+            raise RuntimeError(
+                "PCP slot mapping size must be divisible by the PCP world size: "
+                f"{expanded_slot_mapping.numel()} % {self.pcp_size} != 0."
+            )
+
+        local_num_input_tokens = expanded_slot_mapping.numel() // self.pcp_size
+        if metadata.num_actual_tokens > local_num_input_tokens:
+            raise RuntimeError(
+                "PCP actual token count exceeds the rank-local padded token count: "
+                f"{metadata.num_actual_tokens} > {local_num_input_tokens}."
+            )
+
+        metadata.slot_mapping = expanded_slot_mapping
+        metadata.pcp_local_num_input_tokens = local_num_input_tokens
+        if metadata.num_prefills > 0:
+            metadata.attn_state = AscendAttentionState.ChunkedPrefill
 
     def build_for_graph_capture(
         self,
@@ -438,58 +615,6 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         return attn_metadata
 
 
-class AscendAttentionPCPMetadataBuilder(AscendAttentionMetadataBuilder):
-    """Build GQA metadata while retaining expanded cache slots."""
-
-    metadata_cls = AscendAttentionPCPMetadata
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
-
-    def _split_decodes_and_prefills(
-        self,
-        common_attn_metadata: AscendCommonAttentionMetadata,
-    ) -> tuple[int, int, int, int]:
-        return split_decodes_and_prefills(
-            common_attn_metadata,
-            decode_threshold=self.decode_threshold,
-            treat_short_extends_as_decodes=False,
-        )
-
-    def build(
-        self,
-        common_prefix_len: int,
-        common_attn_metadata: AscendCommonAttentionMetadata,
-        fast_build: bool = False,
-    ) -> AscendAttentionPCPMetadata:
-        expanded_slot_mapping = common_attn_metadata.slot_mapping
-        metadata = super().build(
-            common_prefix_len,
-            common_attn_metadata,
-            fast_build,
-        )
-        assert isinstance(metadata, AscendAttentionPCPMetadata)
-        if expanded_slot_mapping.numel() % self.pcp_size != 0:
-            raise RuntimeError(
-                "PCP slot mapping size must be divisible by the PCP world size: "
-                f"{expanded_slot_mapping.numel()} % {self.pcp_size} != 0."
-            )
-
-        local_num_input_tokens = expanded_slot_mapping.numel() // self.pcp_size
-        if metadata.num_actual_tokens > local_num_input_tokens:
-            raise RuntimeError(
-                "PCP actual token count exceeds the rank-local padded token count: "
-                f"{metadata.num_actual_tokens} > {local_num_input_tokens}."
-            )
-
-        metadata.slot_mapping = expanded_slot_mapping
-        metadata.pcp_local_num_input_tokens = local_num_input_tokens
-        if metadata.num_prefills > 0:
-            metadata.attn_state = AscendAttentionState.ChunkedPrefill
-        return metadata
-
-
 class AscendAttentionBackendImpl(AttentionImpl):
     def __init__(
         self,
@@ -507,6 +632,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
         **kwargs,
     ) -> None:
         self.vllm_config = get_current_vllm_config()
+        self.pcp_enabled = (
+            type(self) is AscendAttentionBackendImpl
+            and self.vllm_config.parallel_config.prefill_context_parallel_size > 1
+        )
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -565,6 +694,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
             else:
                 graph_params = get_graph_params()
             with torch.npu.stream(update_stream):
+                # The workspace size depends only on shapes and seq_lens, which
+                # are shared by all layers within one graph-param update pass,
+                # so one get_workspace call per pass is sufficient. Reuse the
+                # workspace across layers and re-query only when any
+                # size-relevant input changes. This mirrors the FIA path, which already
+                # reuses graph_params.workspaces[num_tokens], and removes the
+                # redundant per-layer get_workspace calls (each backed by a
+                # ~36-54MB buffer allocation) per decode step.
+                step_ws_key = None
+                workspace = None
                 for key, param, handle, event in zip(
                     forward_context.attn_metadata,
                     graph_params.attn_params[num_tokens],
@@ -584,17 +723,39 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     ) = param
                     seq_lens = forward_context.attn_metadata[key].seq_lens
 
-                    workspace = torch_npu._npu_paged_attention_get_workspace(
-                        query=query,
-                        key_cache=key_cache,
-                        value_cache=value_cache,
-                        num_kv_heads=num_kv_heads,
-                        num_heads=num_heads,
-                        scale_value=scale,
-                        block_table=block_table,
-                        context_lens=seq_lens,
-                        out=output,
+                    # The key covers every size-relevant input, so models
+                    # with heterogeneous layer configs simply trigger a
+                    # re-query instead of reusing a wrong-sized workspace.
+                    ws_key = (
+                        seq_lens.data_ptr(),
+                        tuple(seq_lens.shape),
+                        query.shape,
+                        query.dtype,
+                        key_cache.shape,
+                        key_cache.dtype,
+                        value_cache.shape,
+                        value_cache.dtype,
+                        block_table.shape if block_table is not None else None,
+                        block_table.dtype if block_table is not None else None,
+                        output.shape,
+                        output.dtype,
+                        num_kv_heads,
+                        num_heads,
+                        scale,
                     )
+                    if step_ws_key != ws_key:
+                        workspace = torch_npu._npu_paged_attention_get_workspace(
+                            query=query,
+                            key_cache=key_cache,
+                            value_cache=value_cache,
+                            num_kv_heads=num_kv_heads,
+                            num_heads=num_heads,
+                            scale_value=scale,
+                            block_table=block_table,
+                            context_lens=seq_lens,
+                            out=output,
+                        )
+                        step_ws_key = ws_key
                     torch.npu.graph_task_update_begin(update_stream, handle)
                     torch_npu._npu_paged_attention(
                         query=query,
@@ -1441,9 +1602,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
             else:
                 # ChunkedPrefill mixing prefill+decode: split into a per-phase
                 # FIA call each (A5 only).
+                # NOTE: Batch-invariant execution also requires prefill and
+                # decode to be processed separately, regardless of the device
+                # generation or attention state. Outside batch-invariant mode,
+                # preserve the existing A5 behavior for performance optimization.
                 if (
-                    is_950()
-                    and attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill
+                    (
+                        envs_vllm.VLLM_BATCH_INVARIANT
+                        or (
+                            get_current_hardware_profile().supports(HardwareCapability.CHUNKED_PREFILL_PHASE_SPLIT)
+                            and attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill
+                        )
+                    )
                     and attn_metadata.num_decodes > 0
                     and attn_metadata.num_prefills > 0
                 ):
@@ -1657,6 +1827,48 @@ class AscendAttentionBackendImpl(AttentionImpl):
             notify_kv_cache_written()
         return query, key, value, output
 
+    # Keep PCP gathering outside reshape_and_cache: derived implementations
+    # such as C8 reuse that method but are outside this PCP feature matrix.
+    # Gathered inputs still flow through the canonical cache writer below.
+    def _reshape_and_cache_pcp(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: tuple[torch.Tensor],
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ):
+        if len(kv_cache) <= 1:
+            return query, key, value, output
+
+        expanded_slot_mapping = attn_metadata.slot_mapping
+        local_num_input_tokens = attn_metadata.pcp_local_num_input_tokens
+        assert local_num_input_tokens is not None, "PCP GQA metadata must be finalized before execution."
+        if key.shape[0] < local_num_input_tokens:
+            raise RuntimeError(
+                f"PCP GQA input is shorter than the rank-local padded batch: {key.shape[0]} < {local_num_input_tokens}."
+            )
+
+        (cache_key, cache_value), cache_slot_mapping = _gather_prefill_cache_inputs(
+            (
+                key[:local_num_input_tokens],
+                value[:local_num_input_tokens],
+            ),
+            expanded_slot_mapping,
+            attn_metadata.num_decode_tokens,
+        )
+        local_num_actual_tokens = attn_metadata.num_actual_tokens
+        try:
+            attn_metadata.slot_mapping = cache_slot_mapping
+            attn_metadata.num_actual_tokens = cache_key.shape[0]
+            self.reshape_and_cache(query, cache_key, cache_value, kv_cache, attn_metadata, output)
+        finally:
+            attn_metadata.slot_mapping = expanded_slot_mapping
+            attn_metadata.num_actual_tokens = local_num_actual_tokens
+
+        return query, key, value, output
+
     def forward_impl(
         self,
         query: torch.Tensor,
@@ -1731,9 +1943,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output_padded = None
         if key is not None and value is not None:
             output_padded = output
-            query, key, value, output_padded = self.reshape_and_cache(
-                query, key, value, kv_cache, attn_metadata, output
-            )
+            if self.pcp_enabled:
+                query, key, value, output_padded = self._reshape_and_cache_pcp(
+                    query, key, value, kv_cache, attn_metadata, output
+                )
+            else:
+                query, key, value, output_padded = self.reshape_and_cache(
+                    query, key, value, kv_cache, attn_metadata, output
+                )
         # pooling model branch
         if attn_metadata.model_runner_type == "pooling" and not attn_metadata.causal:
             attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
@@ -1745,49 +1962,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
         output[:num_tokens] = attn_output[:num_tokens]
         return output
-
-
-class AscendAttentionPCPImpl(AscendAttentionBackendImpl):
-    """MRV2 GQA implementation for prefill context parallelism."""
-
-    supports_pcp = True
-
-    def reshape_and_cache(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: tuple[torch.Tensor],
-        attn_metadata: AscendMetadata,
-        output: torch.Tensor,
-    ):
-        if len(kv_cache) <= 1:
-            return query, key, value, output
-        expanded_slot_mapping = attn_metadata.slot_mapping
-        local_num_input_tokens = attn_metadata.pcp_local_num_input_tokens
-        if key.shape[0] < local_num_input_tokens:
-            raise RuntimeError(
-                f"PCP GQA input is shorter than the rank-local padded batch: {key.shape[0]} < {local_num_input_tokens}."
-            )
-
-        (cache_key, cache_value), cache_slot_mapping = _gather_prefill_cache_inputs(
-            (
-                key[:local_num_input_tokens],
-                value[:local_num_input_tokens],
-            ),
-            expanded_slot_mapping,
-            attn_metadata.num_decode_tokens,
-        )
-        local_num_actual_tokens = attn_metadata.num_actual_tokens
-        try:
-            attn_metadata.slot_mapping = cache_slot_mapping
-            attn_metadata.num_actual_tokens = cache_key.shape[0]
-            super().reshape_and_cache(query, cache_key, cache_value, kv_cache, attn_metadata, output)
-        finally:
-            attn_metadata.slot_mapping = expanded_slot_mapping
-            attn_metadata.num_actual_tokens = local_num_actual_tokens
-
-        return query, key, value, output
 
 
 class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):

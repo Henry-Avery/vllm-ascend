@@ -45,7 +45,14 @@ from vllm.utils.math_utils import cdiv
 from vllm_ascend.quantization.utils import get_dynamic_mx_quant_scale_alg
 from vllm_ascend.utils import FP8_METHOD, is_950, maybe_trans_nz
 
-from ..base import AscendLinearScheme, AscendMoEScheme, QuantType
+from ..base import (
+    AscendLinearScheme,
+    AscendMoEScheme,
+    QuantType,
+    WeightSwitchConfig,
+    WeightSwitchGatherSpec,
+    WeightSwitchRepeatSpec,
+)
 from ..registry import register_scheme
 from .w8a8_mxfp8 import AscendW8A8MXFP8DynamicFusedMoEMethod, AscendW8A8MXFP8DynamicLinearMethod
 
@@ -98,16 +105,33 @@ def resolve_block_scales(
 
 
 def _mx_quantize(resolved: torch.Tensor, scale_alg: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Re-quantize a dense matrix to MXFP8, returning the weight and uint8 scale."""
-    return torch_npu.npu_dynamic_mx_quant(
+    """Re-quantize a dense matrix to MXFP8, returning the weight and uint8 scale.
+
+    ``npu_dynamic_mx_quant`` emits the scale with its group axis already split into
+    ``[..., num_groups // 2, 2]`` pairs, whereas both MXFP8 schemes consume the loader
+    layout ``[..., num_groups]`` and pair the groups up themselves. Collapse the trailing
+    axis so a requantized checkpoint reaches them in the same layout as a native one.
+    """
+    quantized, scale = torch_npu.npu_dynamic_mx_quant(
         resolved,
         dst_type=BLOCK_FP8_WEIGHT_DTYPE,
         scale_alg=scale_alg,
     )
+    return quantized, scale.flatten(-2)
 
 
 def _supports_mx_regroup(in_features: int, group_size: int) -> bool:
     return in_features % group_size == 0
+
+
+def _is_absorbed_by_attention(layer: torch.nn.Module) -> bool:
+    """True for projections that MLA/SFA folds into its own weights.
+
+    ``kv_b_proj`` is split into ``W_UK``/``W_UV`` and the layer is disposed right
+    after, so it never runs a matmul. Quantizing it buys nothing and destroys the
+    dense matrix the attention backend has to absorb.
+    """
+    return getattr(layer, "prefix", "").endswith("kv_b_proj")
 
 
 @register_scheme(FP8_METHOD, "linear")
@@ -119,6 +143,36 @@ class AscendFp8BlockLinearMethod(AscendLinearScheme):
     resolves those tiles and then either re-quantizes to MXFP8 (Ascend 950) or
     keeps the model dtype (everything else).
     """
+
+    supports_weight_switch = True
+
+    # Dense post-processing keeps weight in [output, input] layout.
+    weight_switch_gather_specs = (WeightSwitchGatherSpec("weight", gather_dim=1),)
+    weight_switch_output_gather_specs = (WeightSwitchGatherSpec("weight"),)
+
+    def _get_weight_switch_specs(
+        self,
+        layer: torch.nn.Module,
+        config: WeightSwitchConfig,
+    ) -> tuple[
+        tuple[WeightSwitchGatherSpec, ...],
+        tuple[WeightSwitchRepeatSpec, ...],
+        str,
+    ]:
+        gather_specs, repeat_specs, shard_axis = super()._get_weight_switch_specs(layer, config)
+        if self.mxfp8_method is None:
+            return gather_specs, repeat_specs, shard_axis
+        if shard_axis == "input":
+            return (
+                self.mxfp8_method.weight_switch_gather_specs,
+                self.mxfp8_method.weight_switch_repeat_specs,
+                shard_axis,
+            )
+        return (
+            self.mxfp8_method.weight_switch_output_gather_specs,
+            self.mxfp8_method.weight_switch_output_repeat_specs,
+            shard_axis,
+        )
 
     def __init__(self, weight_block_size: tuple[int, int]):
         self.block_n, self.block_k = weight_block_size
@@ -135,12 +189,10 @@ class AscendFp8BlockLinearMethod(AscendLinearScheme):
             "weight_scale_inv": torch.empty(
                 cdiv(output_size, self.block_n), cdiv(input_size, self.block_k), dtype=torch.float32
             ),
-            # A merged column-parallel loader offsets shards in weight elements,
-            # so it needs to know the scale is one entry per block_n rows.
-            "_packed_dim": 0,
-            "_packed_factor": self.block_n,
-            # A row-parallel loader narrows the scale along the reduction dim.
-            "_input_dim": 1,
+            # Loaders offset shards in weight elements and must convert to scale
+            # entries. Rounding that conversion up matters: a shard whose height
+            # is not a multiple of block_n still owns the tile covering its tail.
+            "_block_quant_scale": (self.block_n, self.block_k),
         }
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -152,6 +204,13 @@ class AscendFp8BlockLinearMethod(AscendLinearScheme):
             self.model_dtype,
         )
         del layer.weight_scale_inv
+
+        if _is_absorbed_by_attention(layer):
+            # Decided locally rather than on the scheme: the attention backend
+            # splits this layer and disposes of it, so apply() is never reached
+            # and nothing about this layer should speak for any other.
+            layer.weight = torch.nn.Parameter(maybe_trans_nz(resolved), requires_grad=False)
+            return
 
         if self.mxfp8_method is not None and not _supports_mx_regroup(resolved.shape[1], self.mxfp8_method.group_size):
             logger.warning_once(
@@ -169,6 +228,11 @@ class AscendFp8BlockLinearMethod(AscendLinearScheme):
             return
 
         quantized, mx_scale = _mx_quantize(resolved, self.mxfp8_method.dynamic_mx_quant_scale_alg)
+        # mx_scale_pairs: CANN 9.1 npu_dynamic_mx_quant packs two E8M0 scales
+        # per entry on a 2D weight, so the native result is [out, in // 64, 2]
+        # while the MXFP8 method unpacks [out, in // 32]. view() keeps the
+        # bytes; reshape() restores the layout the method expects.
+        mx_scale = mx_scale.view(torch.uint8).reshape(resolved.shape[0], -1)
         layer.weight = torch.nn.Parameter(quantized, requires_grad=False)
         layer.weight_scale = torch.nn.Parameter(mx_scale, requires_grad=False)
         self.mxfp8_method.process_weights_after_loading(layer)
@@ -315,7 +379,7 @@ class AscendFp8BlockFusedMoEMethod(AscendMoEScheme):
             )
             quantized, expert_scale = _mx_quantize(resolved, scale_alg)
             weight[expert].copy_(quantized)
-            mx_scale[expert].copy_(expert_scale)
+            mx_scale[expert].copy_(expert_scale.view(torch.uint8).reshape(mx_scale[expert].shape))
         return mx_scale
 
     def get_eplb_weight_views(self, layer: torch.nn.Module) -> list[torch.Tensor]:
