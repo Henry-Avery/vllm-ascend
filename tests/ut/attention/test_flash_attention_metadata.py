@@ -39,7 +39,10 @@ def helpers(monkeypatch):
     def gqa_metadata(heads, kv_heads, dim, **kwargs):
         return metadata(kwargs["cu_seqlens_q"], kwargs["seqused_kv"], kwargs["seqused_q"], kv_heads, kwargs)
 
-    monkeypatch.setattr(torch.ops._C_ascend, "flash_mla_with_kvcache_metadata", mla_metadata, raising=False)
+    # The production path resolves MLA metadata through the external
+    # cann_ops_transformer adapter. AST-extracted helpers share this globals
+    # dictionary, so install the fake dispatcher directly into their scope.
+    scope["flash_mla_with_kvcache_metadata"] = mla_metadata
     package = ModuleType("cann_ops_transformer")
     module = ModuleType("cann_ops_transformer.ops")
     module.flash_attn_metadata = gqa_metadata

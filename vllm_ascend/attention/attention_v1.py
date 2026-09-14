@@ -44,6 +44,7 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
+from vllm_ascend.attention.flash_mla import flash_mla_with_kvcache_metadata
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     enable_dcp,
@@ -296,13 +297,23 @@ def _build_flash_attention_metadata(builder, common, *, is_mla: bool) -> AscendF
             positions = common.positions[:tokens]
             flash.positions[:positions.shape[0]].copy_(positions)
         if is_mla:
-            metadata = torch.ops._C_ascend.flash_mla_with_kvcache_metadata(
+            # The external CANN 9.2 package owns metadata allocation and AICPU
+            # dispatch. Copy its result into the persistent schedule buffer so
+            # the main op sees a stable address across ACL Graph replays.
+            metadata = flash_mla_with_kvcache_metadata(
                 flash.cache_lens, builder.flash_num_heads, 1,
                 cu_seqlens_q=flash.cu, seqused_q=flash.used_q,
                 max_seqlen_q=flash.max_query_len, max_seqlen_kv=flash.max_seq_len,
                 head_dim_qk=576, head_dim_v=512,
                 mask_mode=3 if common.causal else 0, layout_q="TND",
             )
+            if metadata.dtype != torch.int32 or metadata.numel() != flash.schedule.numel():
+                raise RuntimeError(
+                    "The external FlashMLA metadata ABI does not match the "
+                    "persistent A5 schedule buffer: expected "
+                    f"{flash.schedule.numel()} int32 elements, got "
+                    f"{metadata.numel()} elements with dtype {metadata.dtype}."
+                )
         else:
             from cann_ops_transformer.ops import flash_attn_metadata
 

@@ -109,9 +109,9 @@ def test_va_shared_backing_preserves_mixed_views_and_page_holes(with_kv_transfer
     mla = caches["mla1"]
     gqa = caches["gqa"]
     conv, ssm = caches["mamba"]
-    assert mla.shape == (blocks, block_size, 576)
+    assert mla.shape == (blocks, block_size, 1, 576)
     assert gqa.shape == (blocks, 4, block_size, 64)
-    assert mla.stride() == (pitch // 2, 576, 1)
+    assert mla.stride() == (pitch // 2, 576, 576, 1)
     assert gqa.stride() == (pitch // 2, block_size * 64, 64, 1)
     assert conv.shape == (blocks, *shapes[0]) and conv.dtype == torch.bfloat16
     assert ssm.shape == (blocks, *shapes[1]) and ssm.dtype == torch.float32
@@ -136,8 +136,8 @@ def test_va_shared_backing_preserves_mixed_views_and_page_holes(with_kv_transfer
     raw.fill_(-91)
     touched = torch.zeros_like(raw, dtype=torch.bool)
     for page in range(blocks):
-        mla[page, :, :512].fill_(page + 1)
-        mla[page, :, 512:].fill_(page + 2)
+        mla[page, ..., :512].fill_(page + 1)
+        mla[page, ..., 512:].fill_(page + 2)
         gqa[page, :2].fill_(page + 3)
         gqa[page, 2:].fill_(page + 4)
         conv[page].fill_(page + 5)
@@ -145,11 +145,81 @@ def test_va_shared_backing_preserves_mixed_views_and_page_holes(with_kv_transfer
         for name, payload in (("mla1", mla_bytes), ("gqa", 4 * block_size * 64 * 2), ("mamba", state_bytes)):
             start = expected[name] + page * pitch
             touched[start : start + payload] = True
-        assert torch.all(mla[page, :, :512] == page + 1)
-        assert torch.all(mla[page, :, 512:] == page + 2)
+        assert torch.all(mla[page, ..., :512] == page + 1)
+        assert torch.all(mla[page, ..., 512:] == page + 2)
         assert torch.all(gqa[page, :2] == page + 3)
         assert torch.all(gqa[page, 2:] == page + 4)
         assert torch.all(conv[page] == page + 5)
         assert torch.all(ssm[page] == page + 6)
     # Includes untouched layers, page padding, prefix/suffix and alignment slack.
     assert torch.all(raw[~touched] == -91)
+
+
+def test_mla_fused_cache_splits_padded_manager_pages_into_bbnd_kernel_blocks():
+    runner = _runner_methods()
+    manager_blocks = 2
+    manager_block_size = 384
+    kernel_block_size = 128
+    kernel_blocks_per_manager = manager_block_size // kernel_block_size
+    fused_dim = 576
+    element_size = 2
+    logical_slot_bytes = kernel_block_size * fused_dim * element_size
+    slot_bytes = logical_slot_bytes + 15360
+    manager_page_bytes = kernel_blocks_per_manager * slot_bytes
+    offset = 128
+    size = offset + manager_blocks * manager_page_bytes + 64
+
+    spec = SimpleNamespace(
+        block_size=manager_block_size,
+        num_heads=1,
+        num_states=manager_block_size,
+        state_content_size_bytes=fused_dim * element_size,
+        dtype=torch.bfloat16,
+        get_num_kernel_states=lambda kernel_size: kernel_size,
+    )
+    group = SimpleNamespace(
+        layer_names=["mla"], kv_cache_spec=spec, backend=None, kv_cache_group_id=0
+    )
+    config = SimpleNamespace(
+        num_blocks=manager_blocks,
+        kv_cache_groups=[group],
+        kv_cache_tensors=[
+            SimpleNamespace(
+                size=size,
+                layers=["mla"],
+                offset=offset,
+                layer_stride=0,
+                block_stride=manager_page_bytes,
+            )
+        ],
+    )
+    runner.ascend_config = SimpleNamespace(kvpp_config=SimpleNamespace(size=1))
+    runner.vllm_config = SimpleNamespace(kv_transfer_config=None)
+    runner.device = torch.device("cpu")
+    runner.compilation_config = SimpleNamespace(
+        static_forward_context={"mla": _MLAAttention()}
+    )
+    runner.runner_only_attn_layers = set()
+    runner.kernel_block_sizes = [[kernel_block_size]]
+    runner._kv_cache_spec_attn_group_iterator = lambda: iter([group])
+
+    raw_caches = runner._allocate_kv_cache_tensors(config)
+    cache = runner._reshape_kv_cache_tensors(config, raw_caches)["mla"]
+
+    assert cache.shape == (
+        manager_blocks * kernel_blocks_per_manager,
+        kernel_block_size,
+        1,
+        fused_dim,
+    )
+    assert cache.stride() == (slot_bytes // element_size, fused_dim, fused_dim, 1)
+    assert cache.storage_offset() * element_size == offset
+
+    backing = torch.empty(0, dtype=torch.int8).set_(cache.untyped_storage())
+    backing.fill_(-91)
+    touched = torch.zeros_like(backing, dtype=torch.bool)
+    for block in range(cache.shape[0]):
+        cache[block].fill_(block + 1)
+        start = offset + block * slot_bytes
+        touched[start : start + logical_slot_bytes] = True
+    assert torch.all(backing[~touched] == -91)

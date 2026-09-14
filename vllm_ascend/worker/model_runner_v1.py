@@ -5040,18 +5040,49 @@ class NPUModelRunner(GPUModelRunner):
                         kv_caches[layer_name] = tuple(states)
                     else:
                         kernel_bs = self.kernel_block_sizes[group.kv_cache_group_id][0]
+                        assert spec.block_size % kernel_bs == 0
                         ratio = spec.block_size // kernel_bs
-                        assert ratio == 1 or raw.stride(0) == raw.shape[1], (
-                            "Virtual KV blocks require dense pages; use the manager block size for padded pages."
-                        )
-                        cache = raw.view(spec.dtype).view(
-                            raw.shape[0] * ratio,
-                            spec.num_heads,
-                            spec.get_num_kernel_states(kernel_bs),
-                            spec.state_content_size_bytes // get_dtype_size(spec.dtype),
-                        )
                         layer = self.compilation_config.static_forward_context[layer_name]
-                        kv_caches[layer_name] = cache.squeeze(1) if isinstance(layer, MLAAttention) else cache
+                        if isinstance(layer, MLAAttention):
+                            # Expose the token-fused MLA cache directly as PA_BBND.
+                            # The manager page may contain several kernel blocks and
+                            # padding after each physical slot, so derive the kernel
+                            # slot stride from the real manager-page stride.
+                            typed_raw = raw.view(spec.dtype)
+                            states = spec.get_num_kernel_states(kernel_bs)
+                            state_width = spec.state_content_size_bytes // get_dtype_size(
+                                spec.dtype
+                            )
+                            assert typed_raw.stride(0) % ratio == 0
+                            slot_stride = typed_raw.stride(0) // ratio
+                            logical_slot = states * spec.num_heads * state_width
+                            assert slot_stride >= logical_slot
+                            kv_caches[layer_name] = torch.as_strided(
+                                typed_raw,
+                                size=(
+                                    raw.shape[0] * ratio,
+                                    states,
+                                    spec.num_heads,
+                                    state_width,
+                                ),
+                                stride=(
+                                    slot_stride,
+                                    spec.num_heads * state_width,
+                                    state_width,
+                                    1,
+                                ),
+                                storage_offset=typed_raw.storage_offset(),
+                            )
+                        else:
+                            assert ratio == 1 or raw.stride(0) == raw.shape[1], (
+                                "Virtual KV blocks require dense pages; use the manager block size for padded pages."
+                            )
+                            kv_caches[layer_name] = raw.view(spec.dtype).view(
+                                raw.shape[0] * ratio,
+                                spec.num_heads,
+                                spec.get_num_kernel_states(kernel_bs),
+                                spec.state_content_size_bytes // get_dtype_size(spec.dtype),
+                            )
                     continue
 
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may

@@ -26,8 +26,14 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import (
-    AscendAttentionState, AscendFlashAttentionMetadata,
-    _build_flash_attention_metadata, _init_flash_attention_metadata,
+    AscendAttentionState,
+    AscendFlashAttentionMetadata,
+    _build_flash_attention_metadata,
+    _init_flash_attention_metadata,
+)
+from vllm_ascend.attention.flash_mla import (
+    ensure_flash_mla_ops_loaded,
+    flash_mla_with_kvcache,
 )
 from vllm_ascend.attention.utils import (
     MLAPO_MAX_SUPPORTED_TOKENS,
@@ -108,7 +114,7 @@ class AscendMLABackend(AttentionBackend):
         cache_type: str = "",
     ) -> tuple[int, ...]:
         if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
-            return num_blocks, num_kv_heads, block_size, head_size
+            return num_blocks, block_size, num_kv_heads, head_size
         return num_blocks, block_size, num_kv_heads, head_size
 
     @staticmethod
@@ -324,6 +330,10 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         self._device_metadata_enabled = False
         self._device_metadata_tasks: tuple[DeviceMetadataTask, ...] = ()
         if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            # Import the optional CANN 9.2 wheel only after the worker has
+            # selected its NPU, and fail before the first metadata task if the
+            # external FlashMLA ABI is not registered.
+            ensure_flash_mla_ops_loaded()
             impl = vllm_config.compilation_config.static_forward_context[layer_names[0]].impl
             _init_flash_attention_metadata(self, impl)
 
@@ -2118,17 +2128,45 @@ class AscendMLAImpl(MLAAttentionImpl):
         b.query[..., :512].copy_(q_abs)
         b.query[..., 512:].copy_(q_pe)
 
+        if kv_cache.ndim == 4:
+            if kv_cache.shape[2] != 1 or kv_cache.shape[-1] != 576:
+                raise ValueError(
+                    "A5 Flash MLA PA_BBND cache must have shape [P, S, 1, 576], "
+                    f"got {tuple(kv_cache.shape)}"
+                )
+            scatter_cache = kv_cache
+            flash_k_cache = kv_cache
+            layout_kv = "PA_BBND"
+        elif kv_cache.ndim == 3:
+            if kv_cache.shape[-1] != 576:
+                raise ValueError(
+                    "A5 Flash MLA cache must have shape [P, S, 576], "
+                    f"got {tuple(kv_cache.shape)}"
+                )
+            # Compatibility with the original #16468 cache protocol.
+            scatter_cache = kv_cache.unsqueeze(2)
+            flash_k_cache = kv_cache.unsqueeze(1)
+            layout_kv = "PA_BNBD"
+        else:
+            raise ValueError(
+                "A5 Flash MLA cache must be PA_BBND [P, S, 1, 576] or "
+                f"legacy [P, S, 576], got rank {kv_cache.ndim}"
+            )
+
         torch_npu.npu_scatter_pa_kv_cache(
             key=c_kv.contiguous(), value=k_pe.contiguous(),
-            key_cache=kv_cache[..., :512].unsqueeze(2),
-            value_cache=kv_cache[..., 512:].unsqueeze(2),
+            key_cache=scatter_cache[..., :512],
+            value_cache=scatter_cache[..., 512:],
             slot_mapping=b.slots, cache_mode="Norm",
         )
         notify_kv_cache_written(layer_name)
         mask_mode = 3 if meta.causal else 0
-        latent, _ = torch.ops._C_ascend.flash_mla_with_kvcache(
+        # Dispatch through the externally installed CANN 9.2 operator package.
+        # Do not fall back to the repository-built _C_ascend implementation:
+        # validation must fail clearly if the requested package is unavailable.
+        latent, _ = flash_mla_with_kvcache(
             b.query,
-            kv_cache.unsqueeze(1),
+            flash_k_cache,
             block_table=b.block_table,
             cache_seqlens=b.cache_lens,
             cu_seqlens_q=b.cu,
@@ -2140,7 +2178,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             mask_mode=mask_mode,
             max_seqlen_q=b.max_query_len,
             max_seqlen_kv=b.max_seq_len,
-            layout_q="TND", layout_kv="PA_BNBD", layout_out="NTD",
+            layout_q="TND", layout_kv=layout_kv, layout_out="NTD",
             return_softmax_lse=False,
         )
         projected = self._v_up_proj(latent)
@@ -2157,7 +2195,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self,
         layer_name,
         hidden_states: torch.Tensor,  # query in unified attn
-        kv_cache: tuple[torch.Tensor],
+        kv_cache: torch.Tensor | tuple[torch.Tensor, ...],
         attn_metadata: M,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:

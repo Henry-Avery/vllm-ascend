@@ -37,7 +37,8 @@ def cpu_reference(q, cache, blocks, cu, used, lengths, causal, scale):
             continue
         assert 0 <= uq <= cu[b + 1] - cu[b]
         assert kvlen <= blocks.shape[1] * page
-        keys = torch.cat([cache[p] for p in blocks[b].tolist()], dim=0)[:kvlen]
+        # PA_BBND keeps the single latent KV head as an explicit axis.
+        keys = torch.cat([cache[p] for p in blocks[b].tolist()], dim=0)[:kvlen, 0]
         query = q[cu[b] : cu[b] + uq]
         scores = torch.einsum("qhd,kd->hqk", query, keys) * scale
         if causal:
@@ -54,9 +55,15 @@ def cpu_reference(q, cache, blocks, cu, used, lengths, causal, scale):
 class Qualification:
     def __init__(self, args):
         import torch_npu  # noqa: F401
-        import vllm_ascend.vllm_ascend_C  # noqa: F401
+
+        from vllm_ascend.attention.flash_mla import (
+            flash_mla_with_kvcache,
+            flash_mla_with_kvcache_metadata,
+        )
 
         self.torch_npu = torch_npu
+        self.flash_mla = flash_mla_with_kvcache
+        self.flash_mla_metadata = flash_mla_with_kvcache_metadata
         self.args = args
         torch.npu.set_device(args.device)
         self.device = torch.device(f"npu:{args.device}")
@@ -76,7 +83,9 @@ class Qualification:
         storage_size = 128 + self.pages * self.stride + 128
         self.expected_backing = torch.full((storage_size,), -13.0, dtype=self.dtype)
         self.expected_cache = self.expected_backing.as_strided(
-            (self.pages, self.page, 576), (self.stride, 576, 1), self.offset
+            (self.pages, self.page, 1, 576),
+            (self.stride, 576, 576, 1),
+            self.offset,
         )
         self.expected_cache.copy_(self.random(self.expected_cache.shape))
         self.backing = self.expected_backing.to(self.device)
@@ -135,8 +144,12 @@ class Qualification:
             c_npu, r_npu = c.to(self.device), r.to(self.device)
             slots_npu = torch.tensor(slots, dtype=integer, device=self.device)
             self.torch_npu.npu_scatter_pa_kv_cache(
-                c_npu, r_npu, self.cache[..., :512].unsqueeze(2),
-                self.cache[..., 512:].unsqueeze(2), slots_npu, cache_mode="Norm"
+                c_npu,
+                r_npu,
+                self.cache[..., :512],
+                self.cache[..., 512:],
+                slots_npu,
+                cache_mode="Norm",
             )
             torch.npu.synchronize()
             for i, slot in enumerate(slots):
@@ -180,20 +193,20 @@ class Qualification:
                 self.graph_q,
                 self.graph_metadata,
             )
-        produced = torch.ops._C_ascend.flash_mla_with_kvcache_metadata(
+        produced = self.flash_mla_metadata(
             lengths, self.heads, 1, cu_seqlens_q=cu, seqused_q=used,
             max_seqlen_q=9, max_seqlen_kv=2 * self.page,
             head_dim_qk=576, head_dim_v=512,
             mask_mode=3 if causal else 0, layout_q="TND",
         )
         metadata.copy_(produced)
-        result = torch.ops._C_ascend.flash_mla_with_kvcache(
-            query, self.cache.unsqueeze(1), block_table=self.blocks,
+        result = self.flash_mla(
+            query, self.cache, block_table=self.blocks,
             cache_seqlens=lengths, cu_seqlens_q=cu, seqused_q=used,
             attn_mask=self.mask if causal else None, metadata=metadata,
             head_dim_v=512, softmax_scale=self.scale,
             mask_mode=3 if causal else 0, max_seqlen_q=9,
-            max_seqlen_kv=2 * self.page, layout_q="TND", layout_kv="PA_BNBD",
+            max_seqlen_kv=2 * self.page, layout_q="TND", layout_kv="PA_BBND",
             layout_out=layout, return_softmax_lse=return_lse,
         )
         if out is not None:
