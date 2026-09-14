@@ -293,7 +293,6 @@ class ACLGraphWrapper:
                 f"got {new_input_addresses}"
             )
 
-        logger.info_once("Replaying aclgraph")
         # In async scheduling or multi-threaded (MT) scenarios, it is possible that
         # the CPU's record event (from update_attn_params) for the iteration i completes
         # before the grph replay of iteration i-1.
@@ -311,6 +310,7 @@ class ACLGraphWrapper:
             self._updatable_graph_replay(forward_context, entry.aclgraph)
         else:
             entry.aclgraph.replay()
+        logger.info_once("Replayed aclgraph for %s model", "draft" if _EXTRA_CTX.is_draft_model else "target")
         return entry.output
 
     def _updatable_graph_replay(
