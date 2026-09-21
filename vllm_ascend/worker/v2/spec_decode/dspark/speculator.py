@@ -30,13 +30,15 @@ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
 )
 
 from vllm_ascend import envs as ascend_envs
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
+from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.utils import (
     get_rotation_path,
     model_uses_sfa_sparse,
     vllm_version_is,
 )
 from vllm_ascend.worker.device_metadata import DeviceMetadataExecutor
+from vllm_ascend.worker.v2.aclgraph_utils import _get_graph_update_backend
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_metadata,
     build_attn_metadata_wrapper,
@@ -131,6 +133,18 @@ class AscendDSparkSpeculator(DSparkSpeculator):
                     attn_backends[layer_name] = attn_layers[layer_name].get_attn_backend()
 
             self.attn_backends = attn_backends
+            backend = _get_graph_update_backend(self.attn_groups)
+            if issubclass(backend, AscendMLABackend):
+                self.attn_architecture = "MLA"
+            elif issubclass(backend, AscendAttentionBackend):
+                self.attn_architecture = "GQA"
+            else:
+                self.attn_architecture = None
+
+    def _draft_query_attn_state(self):
+        if self.attn_architecture == "MLA" and ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            return AscendAttentionState.SpecDecoding
+        return AscendAttentionState.ChunkedPrefill
 
     @contextmanager
     def draft_capture_context(self):
@@ -143,7 +157,7 @@ class AscendDSparkSpeculator(DSparkSpeculator):
         def build_query_metadata(*args, **kwargs):
             kwargs["positions"] = self.input_buffers.positions[: kwargs["num_tokens"]]
             kwargs["is_prefilling"] = torch.zeros(kwargs["num_reqs"], dtype=torch.bool)
-            kwargs["attn_state"] = AscendAttentionState.SpecDecoding
+            kwargs["attn_state"] = self._draft_query_attn_state()
             return build_attn_metadata(*args, **kwargs)
 
         try:
@@ -164,12 +178,12 @@ class AscendDSparkSpeculator(DSparkSpeculator):
                 self.input_buffers.positions,
                 num_tokens_padded,
                 torch.zeros(num_reqs_padded, dtype=torch.bool)
-                if self.attn_architecture == "MLA"
+                if self.attn_architecture in ("GQA", "MLA")
                 else torch.from_numpy(self.input_batch.is_prefilling_np),
-                attn_state=AscendAttentionState.SpecDecoding if self.attn_architecture == "MLA" else None,
+                attn_state=self._draft_query_attn_state() if self.attn_architecture in ("GQA", "MLA") else None,
             ),
         ):
-            attn_metadata = self._build_draft_attn_metadata(
+            attn_metadata = super()._build_draft_attn_metadata(
                 num_reqs=self.input_batch.num_reqs,
                 num_reqs_padded=num_reqs_padded,
                 num_tokens_padded=num_tokens_padded,
@@ -177,13 +191,34 @@ class AscendDSparkSpeculator(DSparkSpeculator):
                 step=self.num_query_per_req,
                 causal=self._group_causal,
             )
-        return [self._update_draft_attn_metadata(attn_metadata, num_reqs_padded)]
+        if self.attn_architecture in ("GQA", "MLA"):
+            attn_metadata = self._update_draft_attn_metadata(attn_metadata, num_reqs_padded)
+        return [attn_metadata]
 
     def _build_draft_attn_metadata(self, *, num_reqs_padded, **kwargs):
-        metadata = super()._build_draft_attn_metadata(num_reqs_padded=num_reqs_padded, **kwargs)
-        if self.attn_architecture == "MLA":
-            return self._update_draft_attn_metadata(metadata, num_reqs_padded)
-        return metadata
+        if self.attn_architecture not in ("GQA", "MLA"):
+            return super()._build_draft_attn_metadata(num_reqs_padded=num_reqs_padded, **kwargs)
+
+        num_tokens_padded = kwargs["num_tokens_padded"]
+        uses_flash_mla = self.attn_architecture == "MLA" and ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA
+        if not uses_flash_mla:
+            # FIA requires cumulative query lengths covering every input token,
+            # including DP padding in eager/PIECEWISE (upstream #56181).
+            assert num_tokens_padded % self.num_query_per_req == 0, "Draft tokens must contain whole query groups"
+            num_reqs_padded = num_tokens_padded // self.num_query_per_req
+        # FlashMLA keeps device query boundaries and a final zero-used padding
+        # row. Do not turn that padding into live requests to satisfy FIA rules.
+        with (
+            build_attn_metadata_wrapper(),
+            build_draft_attn_metadata_factory(
+                self.input_buffers.positions,
+                num_tokens_padded,
+                torch.zeros(num_reqs_padded, dtype=torch.bool),
+                attn_state=self._draft_query_attn_state(),
+            ),
+        ):
+            metadata = super()._build_draft_attn_metadata(num_reqs_padded=num_reqs_padded, **kwargs)
+        return self._update_draft_attn_metadata(metadata, num_reqs_padded)
 
     def _update_draft_attn_metadata(self, attn_metadata, num_reqs_padded):
         """Rebuild ``actual_seq_lengths_q`` from the padded request count,
@@ -205,8 +240,6 @@ class AscendDSparkSpeculator(DSparkSpeculator):
             if getattr(metadata, "flash", None) is not None:
                 continue
             decode_metadata = metadata.decode if self.attn_architecture == "MLA" else metadata
-            if self.attn_architecture == "MLA":
-                metadata.attn_state = AscendAttentionState.SpecDecoding
             decode_metadata.actual_seq_lengths_q = query_lens_list
         return attn_metadata
 

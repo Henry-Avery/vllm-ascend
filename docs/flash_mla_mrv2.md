@@ -1,5 +1,41 @@
 # MRV2 external FlashMLA integration (Draft)
 
+## Handoff snapshot, not a new-main integration
+
+This branch preserves `708e1b9a1c009ae5091cc2287b165f1eeb037378` plus
+four-file DSpark adaptation/test/documentation changes on the old #16456 base
+`fc0580dd2d375ded3cfc7be5c81523429e5b46a6`. It is an implementation reference,
+not an accepted NPU build. The PR body records the exact handoff commit and
+the checks rerun for it. Existing Drafts are not superseded or modified.
+
+To continue on another machine:
+
+```bash
+git clone --branch handoff/flashmla-dspark-708 --single-branch https://github.com/Henry-Avery/vllm-ascend.git
+cd vllm-ascend
+git rev-parse HEAD
+```
+
+Read this document and the handoff PR body before changing code. Historical
+#16468 SHAs below explain this snapshot; they are not the required future
+reference. Obtain the owner's current operator reference through an authorized
+channel and pin its actual SHA before implementation. No private reference
+sources, credentials, or machine configuration are bundled here.
+
+The next integration must use main containing merged #16347 (MRV2 DSpark),
+plus #16456's non-contiguous cache. If #16456 has not updated to that main,
+combine them in a separate integration branch; do not overwrite this snapshot.
+Reuse applicable code and tests here, not its entire obsolete commit history.
+In particular, main's DSpark post-load alignment and this snapshot's load-time
+rotation must not both transform the same weights. Preserve the main framework
+handoff and adapt operator-specific behavior against the current reference.
+
+The final goal remains FlashMLA tiling offload on strided MRV2 cache, including
+target and draft DSpark, graph execution, and a K3 four-card service. Start with
+PCP/DCP=1. No NPU/server execution is authorized by this handoff itself. After
+#16456 merges into main, prepare only our operator integration increment on
+that main and revalidate the final commit before requesting its merge.
+
 ## Scope and reference
 
 This increment starts at [PR #16456](https://github.com/vllm-project/vllm-ascend/pull/16456),
@@ -55,6 +91,29 @@ to the Ascend spec; scheduler groups and allocator geometry are unchanged.
 The query capture factory supplies positions and speculative attention state.
 Replay uses the prepared buffers without a second FIA update/submission.
 
+K3 MLA draft loading consumes the target rotation path saved before MRV2 clears
+the draft quantization config. It folds rotation into context projection weights
+once, before upstream embedding/LM-head sharing, and validates the target's raw
+auxiliary capture boundaries and hidden size. It does not additionally run the
+post-load rotation scheme used by PR #16347.
+
+The initialized draft backend selects MLA, GQA, or the unchanged sparse path.
+For FIA, DP-padded eager/PIECEWISE inputs require padded request counts and query
+lengths ending at the physical token count. FlashMLA instead retains device
+query boundaries and zero-used padding; it must not inherit FIA's synthetic
+query lengths. Query metadata construction supplies the same attention state
+for capture and runtime, with batch-sized positions and non-prefilling flags.
+
+The September 21 adaptation reviews PR #16347 at
+`910a6dcd7b5aaa21fd26ca442f3d1c6dabeaf306`, retaining #16468's earlier
+`e496b86159e641010a22990ac167f3713f138d22` model-loading design. The currently
+observed #16468 head `1a3728a755db7ee95ce2b911526e0e5227fcd7fa` is a closure
+placeholder, not a new integration reference. The new #16456 head
+`fa0be36e85b48c9b6800bc06ca1d2e09dd965c19` retains the dense BBND view but has
+diverged history and other main updates; it has **not** been adopted by this
+fc0580dd-based increment. Migration and revalidation must precede publication
+against that new base.
+
 GQA draft layers remain on the existing GQA/FIA backend; this is not an MLA
 fallback. #16468's separate GQA FlashAttn interface and head-slot allocator are
 not imported. GQA-target/draft combinations require their own graph validation.
@@ -83,12 +142,20 @@ Host contract tests:
 
 ```bash
 python tests/ut/attention/test_flash_mla_host_contract.py -v
+python tests/ut/spec_decode/test_flash_mla_dspark_host_contract.py -v
 ```
 
 They exercise real CPU tensors for buffer identity/refresh, device-task deferral,
 query padding, all four documented head counts, strided aliases/nonzero offset,
 causal/noncausal arguments, and mocked DSpark context writes. They do not execute
 FlashMLA, an NPU scatter, Triton kernels, capture/replay, or collectives.
+
+The DSpark suite executes selected repository methods with heavyweight imports
+and upstream construction/dispatch stubbed. It covers target rotation handoff,
+single rotation and weight ownership, raw auxiliary capture validation, backend
+selection, FIA DP padding, FlashMLA boundary preservation, and restoration of
+the capture factory after exceptions. It does not import the complete model or
+prove that the deployed package, weights, or graph can run.
 
 Required NPU matrix (all pending):
 
