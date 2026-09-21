@@ -57,6 +57,16 @@ def _uses_causal_draft_attention(config) -> bool:
     return bool(getattr(config, "full_attention_causal", False))
 
 
+def _get_target_rotation_path(vllm_config):
+    rotation_path = get_rotation_path(vllm_config)
+    if rotation_path is not None:
+        return rotation_path
+    # MRV2 clears target quantization before constructing a BF16 draft.
+    # Preserve the target path for loading before upstream weight sharing.
+    config = vllm_config.speculative_config.draft_model_config.hf_config
+    return getattr(config, "_ascend_target_rotation_path", None)
+
+
 class AscendK3DSparkDecoderLayer(UpstreamK3DSparkDecoderLayer):
     def __init__(
         self,
@@ -247,7 +257,7 @@ class AscendK3DSparkForCausalLM(UpstreamK3DSparkForCausalLM):
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         assert self.draft_model_config is not None
         self.config = self.draft_model_config.hf_config
-        target_layer_num = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+        target_layer_num = vllm_config.model_config.hf_text_config.num_hidden_layers
         self.model = AscendK3DSparkModel(
             vllm_config=vllm_config,
             start_layer_id=target_layer_num,
@@ -258,7 +268,7 @@ class AscendK3DSparkForCausalLM(UpstreamK3DSparkForCausalLM):
             self.config.draft_vocab_size,
             scale=getattr(self.config, "logit_scale", 1.0),
         )
-        self.rotation_path = get_rotation_path(vllm_config)
+        self.rotation_path = _get_target_rotation_path(vllm_config)
         self.target_model_path = vllm_config.model_config.model
         if self.rotation_path is not None:
             target_config = vllm_config.model_config.hf_text_config
@@ -273,6 +283,30 @@ class AscendK3DSparkForCausalLM(UpstreamK3DSparkForCausalLM):
                 target_config.hidden_size,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
+
+    def configure_target_aux_hidden_capture(self, target_model: nn.Module) -> None:
+        """Select the raw-prefix-sum inputs required by this MLA checkpoint."""
+        target = target_model.get_language_model() if hasattr(target_model, "get_language_model") else target_model
+        setter = getattr(target, "set_dspark_aux_capture_materialized", None)
+        if setter is None:
+            raise ValueError("K3 MLA DSpark requires a target supporting raw-prefix-sum auxiliary capture.")
+        config = self.config
+        target_layers = getattr(config, "dspark_target_layer_ids", None) or getattr(config, "target_layer_ids", None)
+        if not target_layers:
+            raise ValueError("K3 MLA DSpark requires target_layer_ids.")
+        boundaries = tuple(int(layer) + 1 for layer in target_layers)
+        if len(set(boundaries)) != len(boundaries) or any(
+            layer <= 0 or layer > target.model.config.num_hidden_layers for layer in boundaries
+        ):
+            raise ValueError(f"Invalid K3 MLA target layer boundaries: {boundaries}.")
+        aux_layers = getattr(target.model, "aux_hidden_state_layers", None)
+        if aux_layers is None or tuple(aux_layers) != boundaries:
+            raise ValueError("K3 MLA draft and target auxiliary layer boundaries do not match.")
+        if target.model.config.hidden_size != config.target_hidden_size:
+            raise ValueError("K3 MLA draft and target hidden sizes do not match.")
+        if getattr(config, "num_target_layers", len(boundaries)) != len(boundaries):
+            raise ValueError("K3 MLA num_target_layers does not match target_layer_ids.")
+        setter(False)
 
     def get_draft_attn_causal(self) -> list[bool]:
         causal = _uses_causal_draft_attention(self.config)
