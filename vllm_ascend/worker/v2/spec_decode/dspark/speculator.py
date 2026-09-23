@@ -28,6 +28,7 @@ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
     DSparkSpeculator,
 )
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.worker.dcp_utils import DCPManager
@@ -147,6 +148,11 @@ class AscendDSparkSpeculator(DSparkSpeculator):
             max_model_len=self.max_model_len,
         )
 
+    def _draft_query_attn_state(self):
+        if self.attn_architecture == "MLA" and ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            return AscendAttentionState.SpecDecoding
+        return AscendAttentionState.ChunkedPrefill
+
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
         assert self.input_batch is not None
         num_tokens_padded = num_reqs_padded * self.num_query_per_req
@@ -160,7 +166,7 @@ class AscendDSparkSpeculator(DSparkSpeculator):
                 num_tokens_padded,
                 is_prefilling=is_prefilling,
                 seq_lens_cpu=seq_lens_cpu,
-                attn_state=AscendAttentionState.ChunkedPrefill,
+                attn_state=self._draft_query_attn_state(),
                 parallel_config=self.attn_vllm_config.parallel_config,
             ),
         ):
@@ -186,8 +192,13 @@ class AscendDSparkSpeculator(DSparkSpeculator):
         # TODO: Replace this temporary padding workaround with upstream #56181's
         # actual-token metadata and MLA input slicing for non-FULL execution.
         num_tokens_padded = kwargs["num_tokens_padded"]
-        assert num_tokens_padded % self.num_query_per_req == 0, "Draft tokens must contain whole query groups"
-        num_reqs_padded = num_tokens_padded // self.num_query_per_req
+        uses_flash_mla = self.attn_architecture == "MLA" and ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA
+        if not uses_flash_mla:
+            assert num_tokens_padded % self.num_query_per_req == 0, "Draft tokens must contain whole query groups"
+            num_reqs_padded = num_tokens_padded // self.num_query_per_req
+        # FlashMLA keeps the upstream device boundaries. Its metadata builder
+        # accounts for physical padding with a final zero-used row, not fake
+        # requests introduced to satisfy FIA's last-cumulative-length rule.
 
         seq_lens_cpu, is_prefilling = self._prepare_draft_dcp_metadata_inputs(
             kwargs["num_reqs"], num_reqs_padded, kwargs["step"]
@@ -199,7 +210,7 @@ class AscendDSparkSpeculator(DSparkSpeculator):
                 num_tokens_padded,
                 is_prefilling=is_prefilling,
                 seq_lens_cpu=seq_lens_cpu,
-                attn_state=AscendAttentionState.ChunkedPrefill,
+                attn_state=self._draft_query_attn_state(),
                 parallel_config=self.attn_vllm_config.parallel_config,
             ),
         ):
@@ -223,6 +234,10 @@ class AscendDSparkSpeculator(DSparkSpeculator):
         """
         query_lens_list = [(i + 1) * self.num_query_per_req for i in range(num_reqs_padded)]
         for metadata in attn_metadata.values():
+            if getattr(metadata, "flash", None) is not None:
+                # The fresh schedule and device lengths already describe this
+                # draft batch. There is no legacy FIA decode object to update.
+                continue
             decode_metadata = metadata.decode if self.attn_architecture == "MLA" else metadata
             decode_metadata.actual_seq_lengths_q = query_lens_list
         return attn_metadata
@@ -256,12 +271,16 @@ class AscendDSparkSpeculator(DSparkSpeculator):
             # TODO: Remove this guard once main2main includes upstream vLLM
             # #54856 (facd9a74a1), which resets the profiling DP counts.
             sync_state = None
+        uses_flash_mla = self.attn_architecture == "MLA" and ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA
         with (
             build_attn_metadata_wrapper(),
             build_draft_attn_metadata_factory(
                 self.input_buffers.positions,
                 self.max_num_tokens,
-                torch.from_numpy(self.input_batch.is_prefilling_np),
+                torch.zeros(self.max_num_reqs, dtype=torch.bool)
+                if uses_flash_mla
+                else torch.from_numpy(self.input_batch.is_prefilling_np),
+                attn_state=self._draft_query_attn_state() if uses_flash_mla else None,
                 parallel_config=self.attn_vllm_config.parallel_config,
             ),
         ):
