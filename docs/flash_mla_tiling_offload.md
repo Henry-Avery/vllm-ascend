@@ -1,4 +1,4 @@
-# Minimal MRV2 FlashMLA tiling offload
+# MRV2 FlashMLA tiling offload
 
 This opt-in integration connects the external FlashMLA metadata operator to
 the attention operator. It does not implement a new kernel or cache allocator.
@@ -8,7 +8,7 @@ The dependency baseline supplies token-fused, page-strided MLA cache views.
 
 1. MRV2 supplies device sequence lengths, query boundaries, slots and block tables.
 2. `flash_mla_with_kvcache_metadata` generates a fresh schedule per batch on the
-   current stream. No device length is converted to a CPU list by this adapter.
+   metadata executor's stream. No device length is converted to a CPU list by this adapter.
 3. Ordinary projections form absorbed Q. The stride-aware writer updates the
    existing cache through its latent/RoPE slices, preserving page and token strides.
 4. `flash_mla_with_kvcache` consumes Q, the original cache and the same batch's
@@ -23,7 +23,8 @@ users. This change does not claim removal of all engine synchronization.
 
 - Default off: `VLLM_ASCEND_ENABLE_FLASH_MLA=0` (valid values `0` and `1`).
 - Enable with `VLLM_ASCEND_ENABLE_FLASH_MLA=1`, `VLLM_USE_V2_MODEL_RUNNER=1` and
-  `--enforce-eager`. Requires A5, BF16 dense MLA, unquantized BF16 KV, PCP/DCP=1.
+  A5, BF16 dense MLA, unquantized BF16 KV, PCP/DCP=1. Eager remains a useful
+  first correctness baseline; the graph follow-up also wires ACL graph execution.
 - Both external operators must be installed in `cann_ops_transformer.ops`.
   Missing operators fail; there is no silent FIA fallback.
 - Q: `TND [T,H,576]`, actual local heads 8/12/64/96; no replicated/fake heads.
@@ -39,15 +40,15 @@ users. This change does not claim removal of all engine synchronization.
 - RoPE layers rotate their 64-channel operands; NoPE layers retain those channels
   without rotation. Models with a zero-dimensional RoPE operand are not supported.
 - An optional dense MLA DSpark draft can use the same two operators; both target
-  and draft must use eager execution. Other speculative methods are rejected.
-- No C8, DCP merge, PD/KV transfer or graph lifecycle is added. DSpark requires
+  and draft have separate metadata builders/executors. Other speculative methods are rejected.
+- No C8, DCP merge or PD/KV transfer is added. DSpark requires
   PP=1 and fixed-length verification (adaptive verification disabled).
   Enabling unsupported execution modes fails explicitly.
   Other backends in a hybrid model are unchanged.
 
 The initial increment was extracted from the earlier public FlashMLA handoff.
-This follow-up adds only the DSpark eager integration described below, without
-importing graph, DCP helpers or fused output kernels. Cache layout/lifetime
+The first follow-up adds DSpark eager integration; the next adds graph lifecycle
+without importing DCP helpers or fused output kernels. Cache layout/lifetime
 changes belong to the dependency branch, not this increment.
 
 ## MLA DSpark eager follow-up
@@ -71,7 +72,8 @@ The operator handoff has two distinct paths:
    Preserve zero-used padding instead of applying FIA's cumulative-query-length
    rewrite. Causal/non-causal configuration selects mask mode 3/0 in both calls.
 
-The context insert and query execution use the current stream in eager mode.
+Context insertion and query execution use the consumer stream. The separate
+metadata stream waits for input preparation; the consumer waits for metadata.
 The draft has its own metadata builder and cache; the target verification pass
 continues using the target builder. Both paths retain actual local Q head counts.
 
@@ -88,8 +90,8 @@ export VLLM_USE_V2_MODEL_RUNNER=1
 
 The checkpoint controls draft causality; do not override it to match a test.
 Only supported actual local head counts are accepted. A launch recipe is not
-startup evidence. The config guard intentionally rejects GQA/sparse drafts,
-draft graphs and other speculative methods in this incremental candidate.
+startup evidence. The config guard intentionally rejects GQA/sparse drafts
+and other speculative methods in this incremental candidate.
 
 Before model acceptance, run the real-package smoke below with and without
 `--non-causal`, then compare the same model/DSpark checkpoint with FlashMLA off
@@ -98,6 +100,58 @@ acceptance, mixed prefill/decode, variable batch sizes and multiple decode steps
 Record acceptance rate separately from correctness and latency; speculative
 decoding is not guaranteed to accelerate every workload. It does not replace
 the non-speculative correctness baseline.
+
+## ACL graph follow-up
+
+This layer reuses the existing MRV2 graph manager and `DeviceMetadataExecutor`.
+It does not change the cache allocator, DSpark acceptance algorithm or model
+weight alignment. Target graphs and draft query graphs use the same external
+metadata/main contract as eager, with these additional lifetime requirements:
+
+1. Capture-time metadata construction reserves stable input and schedule tensors
+   per builder and captured shape. Schedule capacity comes from the installed
+   operator's Meta implementation, not a guessed length formula. The Meta result
+   must be a non-empty 1-D INT32 tensor and match the runtime output capacity.
+2. Every batch updates real device lengths, query boundaries, page tables, slots,
+   positions and the freshly generated schedule in place. Both causal and
+   non-causal multi-query draft graphs retain their captured buffers. Uncaptured
+   eager shapes do not create an unbounded persistent-buffer cache.
+3. Outside capture/replay, the producer waits for prepared inputs and the previous
+   consumer's reuse fence. The consumer stream waits for the new schedule before
+   model execution. Reuse is released only after consumption has been queued.
+4. DSpark context insertion stays outside the query graph. Capture-time draft
+   metadata receives draft positions and causality; runtime metadata is rebuilt
+   once after rejection/input preparation, before query replay. Do not rebuild
+   FIA metadata a second time in the FlashMLA graph manager.
+5. `AscendMLAImpl.update_graph_params` remains the legacy FIA graph-task update
+   hook. FlashMLA bypasses that hook because it consumes updated device buffers;
+   skipping the hook alone would not be a complete graph integration. Existing
+   non-FlashMLA paths retain their prior behavior.
+
+Graph dispatch still follows the backend's existing `UNIFORM_BATCH` support.
+This is not a claim of arbitrary mixed-prefill full graphs, every graph backend,
+or graph-safe external binaries. Unsupported Meta capacity or uncaptured replay
+buckets fail explicitly rather than using stale buffers or silently falling back.
+
+For target graphs, omit `--enforce-eager` and retain the deployment's supported
+MRV2 ACL graph configuration. For draft graphs, also set speculative
+`"enforce_eager":false`. The latter does not force the runner to enable a graph
+mode disabled by its global configuration. Validate target-only graphs first,
+then target graphs + eager DSpark, then target graphs + draft graphs. Confirm
+actual capture/replay in logs rather than inferring it from flags.
+
+The graph operator smoke is opt-in and uses the real package:
+
+```bash
+python tests/e2e/nightly/single_node/ops/flash_mla_tiling_smoke.py --heads 8 --graph
+python tests/e2e/nightly/single_node/ops/flash_mla_tiling_smoke.py --heads 12 --graph --non-causal
+```
+
+It captures the main operator, regenerates metadata outside the graph, and
+replays with changed lengths, page-table contents and Q, checking stable pointers,
+CPU reference outputs and exact cache guards. It is not a model capture test:
+model projections/cache writes, context insertion, auxiliary states, rejection
+handling and multi-rank graph behavior still require end-to-end validation.
 
 ## Validation and reproduction
 
@@ -129,7 +183,9 @@ Record both repository SHAs, package/CANN/torch_npu versions and commands with l
 
 Real-package smoke, model eager, long contexts (100K/128K), Batch 29-32 and
 performance remain **pending** until run on the candidate SHA. DSpark startup,
-context/query numerical correctness and multi-step model tests are also pending.
+context/query numerical correctness, multi-step model tests, ACL graph capture/
+replay, graph/eager agreement and speedup are also pending. CPU/mock coverage
+checks stable pointers, task scheduling and wrapper cleanup, not real NPU events.
 FP16/PA_Nz package
 capability tests are outside this BF16/BBND integration, not declared unsupported
-by the operator. Graph execution is not supported by this eager follow-up.
+by the operator. No NPU startup, correctness or performance result is claimed.

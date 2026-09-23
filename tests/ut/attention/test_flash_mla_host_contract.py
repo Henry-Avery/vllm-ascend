@@ -6,10 +6,14 @@ import ast
 import sys
 import types
 import unittest
-from contextlib import contextmanager
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
+from enum import IntEnum
 from pathlib import Path
 from types import SimpleNamespace as NS
+from typing import Any
 from unittest.mock import patch
 
 import torch
@@ -48,7 +52,7 @@ class FlashMLAHostContract(unittest.TestCase):
 
         def metadata(lengths, heads, kv_heads, **kwargs):
             self.calls.append(("metadata", lengths, heads, kv_heads, kwargs))
-            return torch.full((lengths.numel() * 8,), len(self.calls), dtype=torch.int32)
+            return torch.full((lengths.numel() * 8,), len(self.calls), dtype=torch.int32, device=lengths.device)
 
         def main(query, cache, **kwargs):
             self.calls.append(("main", query, cache, kwargs))
@@ -59,6 +63,16 @@ class FlashMLAHostContract(unittest.TestCase):
         self.modules = patch.dict(sys.modules, {"cann_ops_transformer.ops": package})
         self.modules.start()
         self.addCleanup(self.modules.stop)
+        self.device_api = load_definitions(
+            "vllm_ascend/worker/device_metadata.py",
+            {"DeviceMetadataStage", "DeviceMetadataTask", "DeviceMetadataExecutor"},
+            torch=torch,
+            dataclass=dataclass,
+            IntEnum=IntEnum,
+            Callable=Callable,
+            Iterable=Iterable,
+            BatchDescriptor=object,
+        )
         self.api = load_definitions(
             "vllm_ascend/attention/flash_mla.py",
             torch=torch,
@@ -68,6 +82,8 @@ class FlashMLAHostContract(unittest.TestCase):
             FLASH_MLA_QK_DIM=576,
             FLASH_MLA_V_DIM=512,
             FLASH_MLA_MASK_SIZE=2048,
+            DeviceMetadataStage=self.device_api.DeviceMetadataStage,
+            DeviceMetadataTask=self.device_api.DeviceMetadataTask,
         )
 
     def builder(self, heads=8):
@@ -128,7 +144,7 @@ class FlashMLAHostContract(unittest.TestCase):
         self.assertEqual(second.cache_lens[0], 129)
         self.assertEqual(first.block_table[0, 0], 0)
         self.assertEqual(second.block_table[0, 0], 7)
-        self.assertFalse(hasattr(builder, "_flash_buffers"))
+        self.assertEqual(builder._flash_buffers, {})
 
     def test_main_consumes_exact_metadata_and_original_cache(self):
         for causal in (True, False):
@@ -321,7 +337,6 @@ class FlashMLAHostContract(unittest.TestCase):
         with patch.dict(sys.modules, {hardware.__name__: hardware}):
             api._validate_flash_mla_config(cfg)
             for obj, field, value in (
-                (cfg.model_config, "enforce_eager", False),
                 (cfg, "speculative_config", NS(method="dspark")),
                 (cfg.parallel_config, "decode_context_parallel_size", 2),
                 (cfg.parallel_config, "prefill_context_parallel_size", 2),
@@ -397,6 +412,7 @@ class FlashMLAHostContract(unittest.TestCase):
             AscendAttentionState=NS(SpecDecoding="spec", ChunkedPrefill="prefill"),
             build_attn_metadata_wrapper=wrappers.build_attn_metadata_wrapper,
             build_draft_attn_metadata_factory=wrappers.build_draft_attn_metadata_factory,
+            device_metadata_context=lambda _: nullcontext(),
         )
         spec = cls()
         spec.attn_architecture = "MLA"
@@ -413,6 +429,7 @@ class FlashMLAHostContract(unittest.TestCase):
         spec.table = torch.tensor([[1, 0], [0, 0], [0, 0], [0, 0]], dtype=torch.int32)
         spec.slots = torch.tensor([254, 255, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1])
         spec.fail = False
+        spec.device_metadata_executor = None
         return spec, enabled, module, wrappers
 
     def test_dspark_query_device_lengths_padding_and_refresh(self):
@@ -532,7 +549,7 @@ class FlashMLAHostContract(unittest.TestCase):
             self.assertTrue(torch.equal(latent[:, 0], transformed[:, :512]))
             self.assertTrue(torch.equal(rope[:, 0], transformed[:, 512:]))
 
-    def test_dspark_scope_allows_only_supported_eager_configuration(self):
+    def test_dspark_scope_allows_eager_and_graph_configuration(self):
         hardware = types.ModuleType("vllm_ascend.device.device_config")
         hardware.is_950 = lambda: True
         api = load_definitions(
@@ -557,10 +574,13 @@ class FlashMLAHostContract(unittest.TestCase):
             kv_transfer_config=None,
         )
         with patch.dict(sys.modules, {hardware.__name__: hardware}):
-            api._validate_flash_mla_config(cfg)
+            for target_eager in (False, True):
+                for draft_eager in (False, True):
+                    cfg.model_config.enforce_eager = target_eager
+                    spec.enforce_eager = draft_eager
+                    api._validate_flash_mla_config(cfg)
             for obj, field, value in (
                 (spec, "method", "eagle"),
-                (spec, "enforce_eager", False),
                 (spec, "enable_adaptive_verification", True),
                 (spec, "draft_model_config", None),
                 (draft, "use_mla", False),
@@ -573,6 +593,335 @@ class FlashMLAHostContract(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     api._validate_flash_mla_config(cfg)
                 setattr(obj, field, old)
+
+    def captured(self, builder, common):
+        builder._flash_capture = True
+        builder._device_metadata_enabled = True
+        result = self.api.build_flash_mla_metadata(builder, common)
+        builder._flash_capture = False
+        return result
+
+    def test_graph_multiquery_stable_addresses_and_deferred_updates(self):
+        for causal in (False, True):
+            builder, common = self.builder(), self.common(batch=2, query=3, causal=causal)
+            first = self.captured(builder, common)
+            self.assertTrue(first.graph_buffer)
+            self.assertEqual(first.cache_lens.tolist(), [0, 0, 0])
+            builder._device_metadata_tasks[0].run()
+            pointers = {
+                name: value.data_ptr() for name, value in vars(first).items() if isinstance(value, torch.Tensor)
+            }
+            original_schedule = first.schedule.clone()
+            common.seq_lens[:] = torch.tensor([130, 0])
+            common.block_table_tensor.add_(9)
+            common.positions.add_(8)
+            second = self.api.build_flash_mla_metadata(builder, common)
+            self.assertIs(first, second)
+            self.assertEqual(first.cache_lens[0], 128000)
+            builder._device_metadata_tasks[0].run()
+            self.assertEqual(second.cache_lens.tolist(), [130, 0, 0])
+            self.assertEqual(second.used_q.tolist(), [3, 0, 0])
+            self.assertEqual(second.slots.tolist(), [0, 1, 2, -1, -1, -1, -1, -1])
+            self.assertEqual(second.block_table[0, 0], 9)
+            self.assertEqual(second.positions[0], 8)
+            self.assertFalse(torch.equal(original_schedule, second.schedule))
+            self.assertEqual(
+                pointers, {n: v.data_ptr() for n, v in vars(second).items() if isinstance(v, torch.Tensor)}
+            )
+            self.api.validate_flash_graph_metadata({"draft": NS(flash=second)})
+
+    def test_graph_buckets_and_target_draft_are_isolated(self):
+        target, draft = self.builder(), self.builder()
+        common = self.common()
+        first = self.captured(target, common)
+        second = self.captured(draft, common)
+        third = self.captured(target, self.common(batch=2))
+        self.assertEqual(len({b.schedule.data_ptr() for b in (first, second, third)}), 3)
+        self.assertEqual(len(target._flash_buffers), 2)
+        target._device_metadata_enabled = False
+        unseen = self.api.build_flash_mla_metadata(target, self.common(batch=3))
+        self.assertFalse(unseen.graph_buffer)
+        self.assertEqual(len(target._flash_buffers), 2)
+        with self.assertRaisesRegex(RuntimeError, "No captured"):
+            self.api.validate_flash_graph_metadata({"layer": NS(flash=unseen)})
+        with self.assertRaisesRegex(RuntimeError, "executor"):
+            self.api.build_flash_mla_metadata(target, common)
+
+    def test_graph_requires_meta_schema_and_matching_runtime_capacity(self):
+        package = sys.modules["cann_ops_transformer.ops"]
+        for bad in (
+            torch.empty(8, dtype=torch.int32),
+            torch.empty(0, device="meta", dtype=torch.int32),
+            torch.empty(8, device="meta"),
+            torch.empty(2, 4, device="meta", dtype=torch.int32),
+        ):
+            with (
+                patch.object(package, "flash_mla_with_kvcache_metadata", return_value=bad),
+                self.assertRaises(RuntimeError),
+            ):
+                self.captured(self.builder(), self.common())
+        builder = self.builder()
+        first = self.captured(builder, self.common())
+        pointer = first.schedule.data_ptr()
+        with (
+            patch.object(package, "flash_mla_with_kvcache_metadata", return_value=torch.zeros(1, dtype=torch.int32)),
+            self.assertRaisesRegex(RuntimeError, "capacity"),
+        ):
+            builder._device_metadata_tasks[0].run()
+        self.assertEqual(pointer, first.schedule.data_ptr())
+
+    def test_graph_builder_capture_and_task_flags_are_scoped(self):
+        cls = load_methods(
+            "vllm_ascend/attention/mla_v1.py",
+            "AscendMLAMetadataBuilder",
+            {"build_for_cudagraph_capture", "enable_device_metadata", "take_device_metadata_tasks"},
+            MLACommonMetadataBuilder=type("Base", (), {"__class_getitem__": classmethod(lambda cls, _: cls)}),
+            AscendMLAMetadata=object,
+            envs=NS(VLLM_ASCEND_ENABLE_FLASH_MLA=True),
+        )
+        builder = cls()
+        builder._device_metadata_tasks = ()
+        builder.enable_device_metadata()
+        self.assertTrue(builder._device_metadata_enabled)
+        self.assertEqual(builder.take_device_metadata_tasks(), ())
+        self.assertFalse(builder._device_metadata_enabled)
+
+        def fail(*args):
+            self.assertTrue(builder._flash_capture)
+            raise RuntimeError("capture failed")
+
+        builder.build = fail
+        with self.assertRaisesRegex(RuntimeError, "capture failed"):
+            builder.build_for_cudagraph_capture(self.common())
+        self.assertFalse(builder._flash_capture)
+
+    def metadata_context_api(self):
+        variable = ContextVar("test_executor", default=None)
+        api = load_definitions(
+            "vllm_ascend/worker/v2/attn_utils.py",
+            {"device_metadata_context"},
+            contextmanager=contextmanager,
+            DeviceMetadataExecutor=object,
+            _device_metadata_executor=variable,
+        )
+        return variable, api.device_metadata_context
+
+    def test_metadata_context_nested_executors_and_exception_cleanup(self):
+        variable, context = self.metadata_context_api()
+        released = []
+        target = NS(submission_in_flight=True, release=lambda: released.append("target"))
+        draft = NS(submission_in_flight=True, release=lambda: released.append("draft"))
+        with self.assertRaisesRegex(RuntimeError, "consumer failed"), context(target):
+            with context(target):
+                self.assertIs(variable.get(), target)
+            self.assertEqual(released, [])
+            with context(draft):
+                self.assertIs(variable.get(), draft)
+            self.assertIs(variable.get(), target)
+            raise RuntimeError("consumer failed")
+        self.assertIsNone(variable.get())
+        self.assertEqual(released, ["draft", "target"])
+
+    def test_executor_orders_producer_consumer_and_reuse_fence(self):
+        events = []
+
+        def stream(name):
+            return NS(name=name, wait_event=lambda event: events.append((name, "wait", event.name)))
+
+        consumer, producer = stream("consumer"), stream("producer")
+        names = iter(("inputs", "reuse", "ready"))
+
+        def event():
+            name = next(names)
+            return NS(name=name, record=lambda s: events.append((s.name, "record", name)))
+
+        npu = NS(Stream=lambda: producer, Event=event, current_stream=lambda: consumer, stream=lambda _: nullcontext())
+        with patch.object(torch, "npu", npu, create=True):
+            executor = self.device_api.DeviceMetadataExecutor()
+            builder = self.builder()
+            self.captured(builder, self.common())
+            task = builder._device_metadata_tasks[0]
+            executor.submit((task,))
+            executor.wait(task.stage, task.group_id)
+            executor.wait(task.stage, task.group_id)
+            self.assertEqual(
+                events,
+                [
+                    ("consumer", "record", "inputs"),
+                    ("producer", "wait", "inputs"),
+                    ("producer", "record", "ready"),
+                    ("consumer", "wait", "ready"),
+                ],
+            )
+            with self.assertRaisesRegex(RuntimeError, "not been released"):
+                executor.submit((task,))
+            events.append(("consumer", "replay"))
+            executor.release()
+            executor.submit((task,))
+            self.assertEqual(
+                events[-5:],
+                [
+                    ("consumer", "record", "reuse"),
+                    ("consumer", "record", "inputs"),
+                    ("producer", "wait", "inputs"),
+                    ("producer", "wait", "reuse"),
+                    ("producer", "record", "ready"),
+                ],
+            )
+            executor.release()
+
+    def test_dspark_graph_consumes_fresh_metadata_once_without_fia_update(self):
+        class Parent:
+            def run_fullgraph(self, desc):
+                return desc
+
+        cls = load_methods(
+            "vllm_ascend/worker/v2/spec_decode/dflash/aclgraph.py",
+            "DFlashAclGraphManager",
+            {"run_fullgraph"},
+            DFlashCudaGraphManager=Parent,
+            ascend_envs=NS(VLLM_ASCEND_ENABLE_FLASH_MLA=True),
+            validate_flash_graph_metadata=self.api.validate_flash_graph_metadata,
+        )
+        manager = cls()
+        manager.speculator = NS(attn_architecture="MLA", _flash_query_metadata=None)
+        with self.assertRaisesRegex(RuntimeError, "freshly built"):
+            manager.run_fullgraph("replay")
+        metadata = self.captured(self.builder(), self.common(query=3))
+        manager.speculator._flash_query_metadata = {"draft": NS(flash=metadata)}
+        self.assertEqual(manager.run_fullgraph("replay"), "replay")
+        with self.assertRaisesRegex(RuntimeError, "freshly built"):
+            manager.run_fullgraph("replay")
+
+    def test_dspark_capture_factory_preserves_causality_and_restores(self):
+        calls = []
+        module = NS(build_attn_metadata=object())
+        original = module.build_attn_metadata
+        cls = load_methods(
+            "vllm_ascend/worker/v2/spec_decode/dspark/speculator.py",
+            "AscendDSparkSpeculator",
+            {"draft_capture_context", "_draft_query_attn_state"},
+            DSparkSpeculator=object,
+            ascend_envs=NS(VLLM_ASCEND_ENABLE_FLASH_MLA=True),
+            contextmanager=contextmanager,
+            dflash_cudagraph=module,
+            build_attn_metadata=lambda **kw: calls.append(kw),
+            torch=torch,
+            AscendAttentionState=NS(SpecDecoding="spec"),
+        )
+        spec = cls()
+        spec.attn_architecture = "MLA"
+        spec.input_buffers = NS(positions=torch.arange(8))
+        spec.attn_vllm_config = NS(parallel_config=object())
+        with self.assertRaisesRegex(RuntimeError, "capture failed"), spec.draft_capture_context():
+            module.build_attn_metadata(num_tokens=6, num_reqs=2, causal={0: False}, for_cudagraph_capture=True)
+            raise RuntimeError("capture failed")
+        self.assertIs(module.build_attn_metadata, original)
+        self.assertEqual(calls[0]["causal"], {0: False})
+        self.assertTrue(calls[0]["for_cudagraph_capture"])
+        self.assertEqual(calls[0]["positions"].tolist(), list(range(6)))
+        self.assertEqual(calls[0]["is_prefilling"].tolist(), [False, False])
+
+    def test_mrv2_metadata_factory_submits_and_waits_before_consumer(self):
+        variable, context = self.metadata_context_api()
+        events = []
+        api = self.api
+        test = self
+
+        class Builder:
+            def enable_device_metadata(self):
+                self._device_metadata_enabled = True
+
+            def take_device_metadata_tasks(self):
+                self._device_metadata_enabled = False
+                tasks, self._device_metadata_tasks = self._device_metadata_tasks, ()
+                return tasks
+
+            def build(self, common_prefix_len, common_attn_metadata):
+                return NS(flash=api.build_flash_mla_metadata(self, common_attn_metadata))
+
+            def build_for_cudagraph_capture(self, common):
+                self._flash_capture = True
+                try:
+                    return self.build(0, common)
+                finally:
+                    self._flash_capture = False
+
+        class Executor:
+            submission_in_flight = False
+
+            def release(self):
+                events.append("release")
+                self.submission_in_flight = False
+
+            def submit(self, tasks):
+                test.assertFalse(self.submission_in_flight)
+                self.submission_in_flight = True
+                events.append("submit")
+                for task in tasks:
+                    task.run()
+
+            def wait(self, *args):
+                events.append("wait")
+
+        never = type("OtherBuilder", (), {})
+        npu = NS(is_current_stream_capturing=lambda: False)
+        fake_torch = NS(Tensor=torch.Tensor, from_numpy=lambda value: value, npu=npu)
+        factory = load_definitions(
+            "vllm_ascend/worker/v2/attn_utils.py",
+            {"build_attn_metadata"},
+            torch=fake_torch,
+            np=NS(ndarray=torch.Tensor),
+            AttentionGroup=object,
+            Sequence=Sequence,
+            Mapping=Mapping,
+            Any=Any,
+            KVCacheConfig=object,
+            ParallelConfig=object,
+            ModelSpecificAttnMetadata=object,
+            AscendCommonAttentionMetadata=NS,
+            AscendDSAMetadataBuilder=never,
+            AscendSFAMetadataBuilder=never,
+            GDNAttentionMetadataBuilder=never,
+            DeviceMetadataTaskProvider=Builder,
+            _device_metadata_executor=variable,
+        )
+        builder = Builder()
+        builder.device, builder.decode_threshold = "cpu", 1
+        api.init_flash_mla_metadata(builder, NS(num_heads=8, num_kv_heads=1))
+        common = self.common(query=3)
+        kwargs = dict(
+            attn_groups=[[NS(get_metadata_builder=lambda _: builder, layer_names=["a", "b"])]],
+            num_reqs=common.num_reqs,
+            num_tokens=common.num_input_tokens,
+            query_start_loc_gpu=common.query_start_loc,
+            query_start_loc_cpu=common.query_start_loc,
+            max_query_len=3,
+            seq_lens=common.seq_lens,
+            seq_lens_np=common.seq_lens,
+            max_seq_len=128000,
+            block_tables=[common.block_table_tensor],
+            slot_mappings=[common.slot_mapping],
+            positions=common.positions,
+            kv_cache_config=NS(kv_cache_groups=[object()]),
+        )
+        executor = Executor()
+        with context(executor):
+            first = factory.build_attn_metadata(**kwargs, for_cudagraph_capture=True)
+            self.assertIs(first["a"], first["b"])
+            self.assertEqual(events, ["submit", "wait"])
+            events.append("consumer")
+            common.seq_lens.fill_(130)
+            second = factory.build_attn_metadata(**kwargs)
+            self.assertIs(first["a"].flash, second["a"].flash)
+            self.assertEqual(second["a"].flash.cache_lens.tolist(), [130, 0])
+            self.assertEqual(events, ["submit", "wait", "consumer", "release", "submit", "wait"])
+            events.append("replay")
+        self.assertEqual(events[-2:], ["replay", "release"])
+        self.assertFalse(builder._device_metadata_enabled)
+        npu.is_current_stream_capturing = lambda: True
+        with context(executor), self.assertRaisesRegex(RuntimeError, "outside"):
+            factory.build_attn_metadata(**kwargs)
 
 
 if __name__ == "__main__":

@@ -645,7 +645,7 @@ class NPUPlatform(Platform):
 
 
 def _validate_flash_mla_config(vllm_config: VllmConfig) -> None:
-    """Fail closed for combinations outside the minimal eager integration."""
+    """Fail closed for combinations outside the BF16 FlashMLA integration."""
     if not envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
         return
     from vllm_ascend.device.device_config import is_950
@@ -657,8 +657,6 @@ def _validate_flash_mla_config(vllm_config: VllmConfig) -> None:
         errors.append("A5 hardware is required")
     if not vllm_config.use_v2_model_runner:
         errors.append("MRV2 must be enabled")
-    if not model.enforce_eager:
-        errors.append("--enforce-eager is required; graph execution is not wired")
     if not model.use_mla or model_uses_sfa_sparse(model):
         errors.append("dense MLA is required (not sparse/SFA)")
     if model.dtype != torch.bfloat16:
@@ -673,8 +671,6 @@ def _validate_flash_mla_config(vllm_config: VllmConfig) -> None:
     if spec is not None:
         if spec.method != "dspark":
             errors.append("only DSpark speculative decoding is wired")
-        if not getattr(spec, "enforce_eager", False):
-            errors.append("DSpark enforce_eager=true is required; draft graphs are not wired")
         draft = getattr(spec, "draft_model_config", None)
         if draft is None or not draft.use_mla or model_uses_sfa_sparse(draft):
             errors.append("DSpark draft must use dense MLA")

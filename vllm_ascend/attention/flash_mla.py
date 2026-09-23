@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Minimal eager adapter for the external FlashMLA metadata/main operator pair.
+"""External FlashMLA metadata/main adapter for MRV2 eager and ACL graphs.
 
 The runner owns the cache. This adapter keeps its views and page identities;
-only per-batch metadata is materialized. Both operators use the current stream.
+only metadata is materialized. Captured inputs keep stable addresses, while the
+worker updates their contents and schedule outside model graphs before replay.
 """
 
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from dataclasses import dataclass
 import torch
 
 from vllm_ascend.attention.utils import MLA_FLASH_SUPPORTED_Q_HEADS
+from vllm_ascend.worker.device_metadata import DeviceMetadataStage, DeviceMetadataTask
 
 FLASH_MLA_BLOCK_SIZE = 128
 FLASH_MLA_QK_DIM = 576
@@ -29,81 +31,133 @@ class FlashMLAMetadata:
     block_table: torch.Tensor
     slots: torch.Tensor
     token_live: torch.Tensor
+    live_boundaries: torch.Tensor
     positions: torch.Tensor
     attn_mask: torch.Tensor | None
     causal: bool
     is_prefill: bool
+    graph_buffer: bool = False
 
 
 def init_flash_mla_metadata(builder, impl) -> None:
     if impl.num_heads not in MLA_FLASH_SUPPORTED_Q_HEADS or impl.num_kv_heads != 1:
         raise ValueError("FlashMLA requires actual local Q heads in {8, 12, 64, 96} and one KV head")
     builder.flash_num_heads = impl.num_heads
+    builder._flash_buffers = {}
+    builder._flash_capture = False
+    builder._device_metadata_enabled = False
+    builder._device_metadata_tasks = ()
     builder.flash_attn_mask = torch.triu(
         torch.ones((FLASH_MLA_MASK_SIZE, FLASH_MLA_MASK_SIZE), dtype=torch.int8, device=builder.device), diagonal=1
     )
 
 
-def build_flash_mla_metadata(builder, common) -> FlashMLAMetadata:
-    # Lazy import: the default backend does not require the external package.
+def _flash_schedule(flash: FlashMLAMetadata, *, meta: bool = False):
+    # Use the installed package's Meta schema, never guess schedule capacity.
     from cann_ops_transformer.ops import flash_mla_with_kvcache_metadata
 
-    batch = common.num_reqs
-    tokens = max(common.num_actual_tokens, common.num_input_tokens)
-    args = {"dtype": torch.int32, "device": builder.device}
-    # One zero-used request accounts for physical padding, without exposing it
-    # as a real query or allowing it to write any cache slot.
-    cu = torch.empty(batch + 2, **args)
-    cu[: batch + 1].copy_(common.query_start_loc[: batch + 1])
-    cu[-1].fill_(tokens)
-    used_q = torch.zeros(batch + 1, **args)
-    used_q[:batch].copy_(cu[1 : batch + 1] - cu[:batch])
-    used_q[:batch].masked_fill_(common.seq_lens[:batch] <= 0, 0)
-    cache_lens = torch.zeros(batch + 1, **args)
-    cache_lens[:batch].copy_(common.seq_lens[:batch])
-    table = common.block_table_tensor[:batch]
-    block_table = torch.zeros((batch + 1, table.shape[1]), **args)
-    block_table[:batch].copy_(table)
-    boundaries = torch.zeros(tokens + 1, **args)
-    live_rows = (used_q > 0).to(torch.int32)
-    boundaries.scatter_add_(0, cu[:-1].long(), live_rows)
-    boundaries.scatter_add_(0, (cu[:-1] + used_q).long(), -live_rows)
-    token_live = boundaries.cumsum(0)[:tokens] > 0
-    slots = torch.full((tokens,), -1, dtype=torch.int64, device=builder.device)
-    source_slots = common.slot_mapping[:tokens]
-    slots[: source_slots.shape[0]].copy_(source_slots)
-    slots.masked_fill_(~token_live, -1)
-    positions = torch.zeros(tokens, dtype=torch.int64, device=builder.device)
-    source_positions = common.positions[:tokens]
-    positions[: source_positions.shape[0]].copy_(source_positions)
-    schedule = flash_mla_with_kvcache_metadata(
-        cache_lens,
-        builder.flash_num_heads,
+    def tensor(value):
+        return torch.empty_like(value, device="meta") if meta else value
+
+    return flash_mla_with_kvcache_metadata(
+        tensor(flash.cache_lens),
+        flash.num_heads,
         1,
-        cu_seqlens_q=cu,
-        seqused_q=used_q,
+        cu_seqlens_q=tensor(flash.cu),
+        seqused_q=tensor(flash.used_q),
         max_seqlen_q=-1,
         max_seqlen_kv=-1,
         head_dim_qk=FLASH_MLA_QK_DIM,
         head_dim_v=FLASH_MLA_V_DIM,
-        mask_mode=3 if common.causal else 0,
+        mask_mode=3 if flash.causal else 0,
         layout_q="TND",
     )
-    return FlashMLAMetadata(
-        num_tokens=tokens,
-        num_heads=builder.flash_num_heads,
-        schedule=schedule,
-        cu=cu,
-        used_q=used_q,
-        cache_lens=cache_lens,
-        block_table=block_table,
-        slots=slots,
-        token_live=token_live,
-        positions=positions,
-        attn_mask=builder.flash_attn_mask if common.causal else None,
-        causal=common.causal,
-        is_prefill=common.max_query_len > builder.decode_threshold,
-    )
+
+
+def build_flash_mla_metadata(builder, common) -> FlashMLAMetadata:
+    batch = common.num_reqs
+    tokens = max(common.num_actual_tokens, common.num_input_tokens)
+    table = common.block_table_tensor[:batch]
+    is_prefill = common.max_query_len > builder.decode_threshold
+    key = (batch, tokens, table.shape[1], common.causal, is_prefill)
+    # Retain only explicitly captured shapes. Multi-query/causal DSpark also
+    # needs stable buffers; max_query_len alone cannot identify eager prefill.
+    flash = builder._flash_buffers.get(key)
+    if flash is None:
+        args = {"dtype": torch.int32, "device": builder.device}
+        flash = FlashMLAMetadata(
+            num_tokens=tokens,
+            num_heads=builder.flash_num_heads,
+            schedule=torch.empty(0, **args),
+            cu=torch.zeros(batch + 2, **args),
+            used_q=torch.zeros(batch + 1, **args),
+            cache_lens=torch.zeros(batch + 1, **args),
+            block_table=torch.zeros((batch + 1, table.shape[1]), **args),
+            slots=torch.full((tokens,), -1, dtype=torch.int64, device=builder.device),
+            token_live=torch.zeros(tokens, dtype=torch.bool, device=builder.device),
+            live_boundaries=torch.zeros(tokens + 1, **args),
+            positions=torch.zeros(tokens, dtype=torch.int64, device=builder.device),
+            attn_mask=builder.flash_attn_mask if common.causal else None,
+            causal=common.causal,
+            is_prefill=is_prefill,
+            graph_buffer=builder._flash_capture,
+        )
+        if flash.graph_buffer:
+            schedule_meta = _flash_schedule(flash, meta=True)
+            if schedule_meta.device.type != "meta" or schedule_meta.dtype != torch.int32 or schedule_meta.ndim != 1:
+                raise RuntimeError("FlashMLA graphs require the package's 1-D INT32 metadata Meta implementation")
+            if schedule_meta.numel() == 0:
+                raise RuntimeError("FlashMLA metadata Meta returned an empty schedule capacity")
+            flash.schedule = torch.empty_like(schedule_meta, device=builder.device)
+            builder._flash_buffers[key] = flash
+
+    def update() -> None:
+        flash.cu[: batch + 1].copy_(common.query_start_loc[: batch + 1])
+        flash.cu[-1].fill_(tokens)
+        flash.used_q[:batch].copy_(flash.cu[1 : batch + 1] - flash.cu[:batch])
+        flash.used_q[:batch].masked_fill_(common.seq_lens[:batch] <= 0, 0)
+        flash.used_q[batch:].zero_()
+        flash.cache_lens[:batch].copy_(common.seq_lens[:batch])
+        flash.cache_lens[batch:].zero_()
+        flash.block_table[:batch].copy_(table)
+        flash.block_table[batch:].zero_()
+        flash.live_boundaries.zero_()
+        live_rows = (flash.used_q > 0).to(torch.int32)
+        flash.live_boundaries.scatter_add_(0, flash.cu[:-1].long(), live_rows)
+        flash.live_boundaries.scatter_add_(0, (flash.cu[:-1] + flash.used_q).long(), -live_rows)
+        flash.token_live.copy_(flash.live_boundaries.cumsum(0)[:tokens] > 0)
+        flash.slots.fill_(-1)
+        slots = common.slot_mapping[:tokens]
+        flash.slots[: slots.shape[0]].copy_(slots)
+        flash.slots.masked_fill_(~flash.token_live, -1)
+        flash.positions.zero_()
+        positions = common.positions[:tokens]
+        flash.positions[: positions.shape[0]].copy_(positions)
+        schedule = _flash_schedule(flash)
+        if flash.graph_buffer:
+            if schedule.shape != flash.schedule.shape or schedule.dtype != flash.schedule.dtype:
+                raise RuntimeError(
+                    "FlashMLA runtime schedule differs from captured Meta capacity; cannot replay safely"
+                )
+            flash.schedule.copy_(schedule)
+        else:
+            flash.schedule = schedule
+
+    if builder._device_metadata_enabled:
+        builder._device_metadata_tasks = (DeviceMetadataTask(DeviceMetadataStage.ATTENTION, update, id(builder)),)
+    else:
+        if flash.graph_buffer:
+            raise RuntimeError("Captured FlashMLA buffers require the MRV2 device metadata executor")
+        update()
+    return flash
+
+
+def validate_flash_graph_metadata(attn_metadata) -> None:
+    """Never replay using newly allocated inputs instead of captured addresses."""
+    for metadata in (attn_metadata or {}).values():
+        flash = getattr(metadata, "flash", None)
+        if flash is not None and not flash.graph_buffer:
+            raise RuntimeError("No captured FlashMLA metadata bucket matches this replay")
 
 
 def validate_flash_cache(cache: torch.Tensor) -> None:
