@@ -333,6 +333,15 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
     def determine_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
         return ascend_chunked_prefill_workspace_size(vllm_config)
 
+    def enable_device_metadata(self) -> None:
+        self._device_metadata_enabled = True
+
+    def take_device_metadata_tasks(self):
+        tasks = self._device_metadata_tasks
+        self._device_metadata_tasks = ()
+        self._device_metadata_enabled = False
+        return tasks
+
     @classmethod
     def get_cudagraph_support(
         cls: type["AscendMLAMetadataBuilder"],
@@ -778,6 +787,12 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         return decode_metadata
 
     def build_for_cudagraph_capture(self, common_attn_metadata: AscendCommonAttentionMetadata):
+        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            self._flash_capture = True
+            try:
+                return self.build(0, common_attn_metadata)
+            finally:
+                self._flash_capture = False
         capture_metadata = copy(common_attn_metadata)
         if capture_metadata.attn_state is None:
             capture_metadata.attn_state = AscendAttentionState.ChunkedPrefill
@@ -919,6 +934,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         speculative_config=None,
         draft_attn_metadatas=None,
     ):
+        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            # MRV2 builds/waits for the device schedule outside the graph.
+            # This legacy hook updates FIA tasks, not FlashMLA input buffers.
+            return
         if _EXTRA_CTX.is_draft_model:
             if _EXTRA_CTX.is_draft_model_prefill:
                 graph_params = get_draft_graph_prefill_params()

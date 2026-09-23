@@ -19,6 +19,7 @@
 
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -72,6 +73,7 @@ from vllm_ascend.utils import (
     is_hidden_state_cache_spec,
     vllm_version_is,
 )
+from vllm_ascend.worker.device_metadata import DeviceMetadataExecutor, DeviceMetadataTaskProvider
 from vllm_ascend.worker.kvpp_cache import allocate_kvpp_cache
 from vllm_ascend.worker.utils import (
     get_single_raw_mla_backing,
@@ -81,6 +83,28 @@ from vllm_ascend.worker.utils import (
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
+
+
+_device_metadata_executor: ContextVar[DeviceMetadataExecutor | None] = ContextVar(
+    "ascend_mrv2_device_metadata_executor", default=None
+)
+
+
+@contextmanager
+def device_metadata_context(executor: DeviceMetadataExecutor | None):
+    """Fence metadata reuse after the target/draft consumer has been queued."""
+    if executor is None or _device_metadata_executor.get() is executor:
+        yield
+        return
+    token = _device_metadata_executor.set(executor)
+    try:
+        yield
+    finally:
+        try:
+            if executor.submission_in_flight:
+                executor.release()
+        finally:
+            _device_metadata_executor.reset(token)
 
 
 def unwrap_mamba_kv_cache_groups(kv_cache_config: KVCacheConfig) -> KVCacheConfig:
@@ -256,6 +280,10 @@ def build_attn_metadata(
     causal: bool | Mapping[int, bool] = True,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
+    executor = _device_metadata_executor.get()
+    if executor is not None and executor.submission_in_flight:
+        executor.release()
+    device_metadata_tasks = []
     # TODO(Ronald1995): optimize AscendCommonAttentionMetadata.
     # seq_lens_np is used for ascend npus, it maybe None in spec_decode case,
     # we fill it with max_seq_len in case `attn_metadata_builder.build` raise
@@ -338,6 +366,8 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
+            if executor is not None and isinstance(attn_metadata_builder, DeviceMetadataTaskProvider):
+                attn_metadata_builder.enable_device_metadata()
             is_dsa_builder = isinstance(attn_metadata_builder, AscendDSAMetadataBuilder)
             is_sfa_builder = isinstance(attn_metadata_builder, AscendSFAMetadataBuilder)
             consumes_pcp_context = bool(getattr(attn_metadata_builder, "consumes_pcp_context", False))
@@ -382,6 +412,17 @@ def build_attn_metadata(
                 common_ratio_to_sas_metadata = attn_metadata_builder.common_ratio_to_sas_metadata  # type: ignore[assignment]
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
+            if executor is not None and isinstance(attn_metadata_builder, DeviceMetadataTaskProvider):
+                device_metadata_tasks.extend(attn_metadata_builder.take_device_metadata_tasks())
+    if device_metadata_tasks:
+        if torch.npu.is_current_stream_capturing():
+            raise RuntimeError("Device metadata must be built outside the captured model graph")
+        assert executor is not None
+        executor.submit(device_metadata_tasks)
+        # Ordinary events stay outside the graph. Replay and eager consumers
+        # are queued only after these waits, as in the reference MRV2 flow.
+        for task in device_metadata_tasks:
+            executor.wait(task.stage, task.group_id)
     return attn_metadata
 
 
@@ -1185,13 +1226,8 @@ def _reshape_kv_cache_v2(
 
             single_raw_mla_cache = get_single_raw_mla_backing(raw_cache)
 
-            if (
-                single_raw_mla_cache is not None
-                and _uses_single_raw_mla_cache(vllm_config, layer_name, kv_cache_spec)
-            ):
-                attn_module = get_layers_from_vllm_config(
-                    vllm_config, AttentionLayerBase, [layer_name]
-                )[layer_name]
+            if single_raw_mla_cache is not None and _uses_single_raw_mla_cache(vllm_config, layer_name, kv_cache_spec):
+                attn_module = get_layers_from_vllm_config(vllm_config, AttentionLayerBase, [layer_name])[layer_name]
                 kernel_blocks_per_manager = kv_cache_spec.block_size // kernel_block_size
                 slot_bytes = kv_cache_spec.page_size_bytes // kernel_blocks_per_manager
                 component_shape = (
@@ -1231,10 +1267,7 @@ def _reshape_kv_cache_v2(
                     kv_cache_spec.dtype,
                     slot_bytes,
                     offset_bytes=(
-                        kernel_block_size
-                        * kv_cache_spec.num_kv_heads
-                        * nope_dim
-                        * get_dtype_size(kv_cache_spec.dtype)
+                        kernel_block_size * kv_cache_spec.num_kv_heads * nope_dim * get_dtype_size(kv_cache_spec.dtype)
                     ),
                 )
                 kv_caches[layer_name] = (nope_cache, rope_cache)
