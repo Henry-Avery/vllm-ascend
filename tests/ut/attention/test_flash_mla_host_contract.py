@@ -6,6 +6,7 @@ import ast
 import sys
 import types
 import unittest
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -28,6 +29,16 @@ def load_definitions(path, names=None, **namespace):
     with patch.dict(sys.modules, {module.__name__: module}):
         exec(compile(tree, str(ROOT / path), "exec"), module.__dict__)
     return module
+
+
+def load_methods(path, class_name, methods, **namespace):
+    """Execute selected methods unchanged; heavyweight imports stay stubbed."""
+    tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
+    cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in methods]
+    tree.body = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), cls]
+    exec(compile(ast.fix_missing_locations(tree), str(ROOT / path), "exec"), namespace)
+    return namespace[class_name]
 
 
 class FlashMLAHostContract(unittest.TestCase):
@@ -301,7 +312,9 @@ class FlashMLAHostContract(unittest.TestCase):
             model_config=NS(enforce_eager=True, use_mla=True, dtype=torch.bfloat16),
             use_v2_model_runner=True,
             cache_config=NS(cache_dtype="auto"),
-            parallel_config=NS(prefill_context_parallel_size=1, decode_context_parallel_size=1),
+            parallel_config=NS(
+                prefill_context_parallel_size=1, decode_context_parallel_size=1, pipeline_parallel_size=1
+            ),
             speculative_config=None,
             kv_transfer_config=None,
         )
@@ -322,6 +335,244 @@ class FlashMLAHostContract(unittest.TestCase):
                 setattr(obj, field, previous)
             enabled.VLLM_ASCEND_ENABLE_FLASH_MLA = False
             api._validate_flash_mla_config(None)
+
+    def dspark_speculator(self):
+        module = NS(build_attn_metadata=object())
+        builder = self.builder(heads=12)
+
+        def build(**kwargs):
+            spec.last_factory = kwargs
+            if spec.fail:
+                raise RuntimeError("metadata failed")
+            if not enabled.VLLM_ASCEND_ENABLE_FLASH_MLA:
+                query = NS(actual_seq_lengths_q=[])
+                return {"draft": NS(decode=query) if spec.attn_architecture == "MLA" else query}
+            common = self.common(batch=kwargs["num_reqs"], query=spec.num_query_per_req, padding=0)
+            common.num_input_tokens = common.num_actual_tokens = kwargs["num_tokens"]
+            common.query_start_loc = spec.input_buffers.query_start_loc[: kwargs["num_reqs"] + 1]
+            common.seq_lens = spec.input_buffers.seq_lens[: kwargs["num_reqs"]]
+            common.block_table_tensor = spec.table[: kwargs["num_reqs"]]
+            common.slot_mapping = spec.slots[: kwargs["num_tokens"]]
+            common.positions = kwargs["positions"]
+            common.causal = kwargs["causal"]
+            return {"draft": NS(flash=self.api.build_flash_mla_metadata(builder, common), decode=None)}
+
+        wrappers = load_definitions(
+            "vllm_ascend/worker/v2/attn_utils.py",
+            {"build_attn_metadata_wrapper", "build_draft_attn_metadata_factory"},
+            contextmanager=contextmanager,
+            _BUILD_ATTN_METADATA_MODULE=module,
+            build_attn_metadata=build,
+        )
+
+        class Parent:
+            def _build_draft_attn_metadata(self, **kwargs):
+                self.parent_kwargs = kwargs
+                return module.build_attn_metadata(
+                    num_reqs=kwargs["num_reqs_padded"],
+                    num_tokens=kwargs["num_tokens_padded"],
+                    causal=kwargs.get("causal", False),
+                )
+
+            def propose(self, *args, **kwargs):
+                self.parent_propose_args = args
+                return self._build_draft_attn_metadata(
+                    num_reqs=1, num_reqs_padded=1, num_tokens_padded=7, step=3, causal=False
+                )
+
+        enabled = NS(VLLM_ASCEND_ENABLE_FLASH_MLA=True)
+        cls = load_methods(
+            "vllm_ascend/worker/v2/spec_decode/dspark/speculator.py",
+            "AscendDSparkSpeculator",
+            {
+                "_draft_query_attn_state",
+                "_prepare_draft_dcp_metadata_inputs",
+                "_build_draft_attn_metadata",
+                "_update_draft_attn_metadata",
+                "propose",
+            },
+            DSparkSpeculator=Parent,
+            torch=torch,
+            ascend_envs=enabled,
+            AscendAttentionState=NS(SpecDecoding="spec", ChunkedPrefill="prefill"),
+            build_attn_metadata_wrapper=wrappers.build_attn_metadata_wrapper,
+            build_draft_attn_metadata_factory=wrappers.build_draft_attn_metadata_factory,
+        )
+        spec = cls()
+        spec.attn_architecture = "MLA"
+        spec.use_dcp = False
+        spec.num_query_per_req = 3
+        spec.max_num_reqs = 4
+        spec.max_num_tokens = 12
+        spec.attn_vllm_config = NS(parallel_config=NS(decode_context_parallel_size=1))
+        spec.input_buffers = NS(
+            positions=torch.arange(12) + 126,
+            query_start_loc=torch.tensor([0, 3, 3, 3, 3], dtype=torch.int32),
+            seq_lens=torch.tensor([129, 0, 0, 0], dtype=torch.int32),
+        )
+        spec.table = torch.tensor([[1, 0], [0, 0], [0, 0], [0, 0]], dtype=torch.int32)
+        spec.slots = torch.tensor([254, 255, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1])
+        spec.fail = False
+        return spec, enabled, module, wrappers
+
+    def test_dspark_query_device_lengths_padding_and_refresh(self):
+        spec, _, _, _ = self.dspark_speculator()
+        for causal in (False, True):
+            first = spec._build_draft_attn_metadata(
+                num_reqs=1, num_reqs_padded=1, num_tokens_padded=7, step=3, causal=causal
+            )["draft"].flash
+            # Seven physical tokens need not be a whole number of draft groups.
+            self.assertEqual(spec.parent_kwargs["num_reqs_padded"], 1)
+            self.assertEqual(first.cu.tolist(), [0, 3, 7])
+            self.assertEqual(first.used_q.tolist(), [3, 0])
+            self.assertEqual(first.cache_lens.tolist(), [129, 0])
+            self.assertEqual(first.slots.tolist(), [254, 255, 0, -1, -1, -1, -1])
+            self.assertEqual(spec.last_factory["attn_state"], "spec")
+            self.assertEqual(spec.last_factory["is_prefilling"].tolist(), [False])
+            self.assertTrue(torch.equal(first.positions, spec.input_buffers.positions[:7]))
+            self.assertEqual(first.num_heads, 12)
+            spec.input_buffers.seq_lens[0] = 130
+            spec.table[0] = torch.tensor([0, 1])
+            second = spec._build_draft_attn_metadata(
+                num_reqs=1, num_reqs_padded=2, num_tokens_padded=7, step=3, causal=causal
+            )["draft"].flash
+            self.assertIsNot(first.schedule, second.schedule)
+            self.assertEqual(first.cache_lens.tolist(), [129, 0])
+            self.assertEqual(second.cache_lens.tolist(), [130, 0, 0])
+            self.assertEqual(second.used_q.tolist(), [3, 0, 0])
+            self.assertEqual(first.block_table[0].tolist(), [1, 0])
+            self.assertEqual(second.block_table[0].tolist(), [0, 1])
+            _, cache = self.cache()
+            self.api.run_flash_mla(torch.zeros(7, 12, 576, dtype=torch.bfloat16), cache, second, 0.125)
+            self.assertIs(self.calls[-1][-1]["metadata"], second.schedule)
+            self.assertEqual(self.calls[-1][-1]["mask_mode"], 3 if causal else 0)
+            if not causal:
+                self.assertIsNone(self.calls[-1][-1]["attn_mask"])
+            spec.input_buffers.seq_lens[0] = 129
+            spec.table[0] = torch.tensor([1, 0])
+
+    def test_dspark_keeps_fia_padding_and_restores_factory_on_failure(self):
+        spec, enabled, module, wrappers = self.dspark_speculator()
+        original = module.build_attn_metadata
+        for architecture in ("MLA", "GQA"):
+            enabled.VLLM_ASCEND_ENABLE_FLASH_MLA = False
+            spec.attn_architecture = architecture
+            result = spec._build_draft_attn_metadata(num_reqs=1, num_reqs_padded=1, num_tokens_padded=6, step=3)[
+                "draft"
+            ]
+            query = result.decode if architecture == "MLA" else result
+            self.assertEqual(query.actual_seq_lengths_q, [3, 6])
+            self.assertEqual(spec.parent_kwargs["num_reqs_padded"], 2)
+            self.assertEqual(spec.last_factory["attn_state"], "prefill")
+        enabled.VLLM_ASCEND_ENABLE_FLASH_MLA = True
+        spec.attn_architecture = "MLA"
+        spec.fail = True
+        with wrappers.build_attn_metadata_wrapper():
+            outer = module.build_attn_metadata
+            with self.assertRaisesRegex(RuntimeError, "metadata failed"):
+                spec._build_draft_attn_metadata(num_reqs=1, num_reqs_padded=1, num_tokens_padded=7, step=3)
+            self.assertIs(module.build_attn_metadata, outer)
+        self.assertIs(module.build_attn_metadata, original)
+
+    def test_dspark_propose_builds_own_query_metadata(self):
+        spec, _, module, _ = self.dspark_speculator()
+        original = module.build_attn_metadata
+        # FlashMLA must not use target prefill flags for the draft query batch.
+        batch = NS(is_prefilling_np=object(), num_reqs=1)
+        target_metadata = {"target": object()}
+        dp_sync = object()
+        result = spec.propose(batch, target_metadata, {}, None, None, None, None, None, None, None, None, dp_sync)
+        self.assertEqual(result["draft"].flash.cache_lens.tolist(), [129, 0])
+        self.assertEqual(spec.last_factory["is_prefilling"].tolist(), [False])
+        self.assertIs(spec.parent_propose_args[1], target_metadata)
+        self.assertIs(spec.parent_propose_args[11], dp_sync)
+        self.assertIs(module.build_attn_metadata, original)
+
+    def test_dspark_context_writer_preserves_cache_and_rejected_slots(self):
+        for use_rope in (False, True):
+            backing, cache = self.cache()
+            expected = backing.clone()
+            expected_cache = torch.as_strided(expected, cache.shape, cache.stride(), cache.storage_offset())
+            data = torch.arange(3 * 576).to(torch.bfloat16).view(3, 576) / 1024
+            slots = torch.tensor([127, 99, -1, 99, 128, 99], dtype=torch.int32)[::2]
+            transformed = data.clone()
+            transformed[:, :512] *= 2
+            if use_rope:
+                transformed[:, 512:] += 1
+            expected_cache[0, 127, 0] = transformed[0]
+            expected_cache[1, 0, 0] = transformed[2]
+
+            def scatter(cache=cache, **kwargs):
+                self.assertEqual(kwargs["key_cache"].stride(), cache.stride())
+                self.assertEqual(kwargs["key_cache"].storage_offset(), cache.storage_offset())
+                self.assertEqual(kwargs["value_cache"].storage_offset(), cache.storage_offset() + 512)
+                self.assertTrue(kwargs["slot_mapping"].is_contiguous())
+                self.assertEqual(kwargs["slot_mapping"].dtype, torch.int64)
+                for i, slot in enumerate(kwargs["slot_mapping"].tolist()):
+                    if slot >= 0:
+                        kwargs["key_cache"][slot // 128, slot % 128] = kwargs["key"][i]
+                        kwargs["value_cache"][slot // 128, slot % 128] = kwargs["value"][i]
+
+            cls = load_methods(
+                "vllm_ascend/attention/mla_v1.py",
+                "AscendMLAImpl",
+                {"exec_kv_prefill"},
+                MLAAttentionImpl=object,
+                torch=torch,
+                envs=NS(VLLM_ASCEND_ENABLE_FLASH_MLA=True),
+                validate_flash_cache=self.api.validate_flash_cache,
+                torch_npu=NS(npu_scatter_pa_kv_cache=scatter),
+            )
+            impl = cls()
+            impl.kv_a_layernorm = lambda x: x * 2
+            impl.use_mla_rope = use_rope
+            impl.rope_single = lambda x, cos, sin: x + 1
+            rope, latent = impl.exec_kv_prefill(data, None, None, cache, slots)
+            self.assertTrue(torch.equal(backing, expected))
+            self.assertTrue(torch.equal(latent[:, 0], transformed[:, :512]))
+            self.assertTrue(torch.equal(rope[:, 0], transformed[:, 512:]))
+
+    def test_dspark_scope_allows_only_supported_eager_configuration(self):
+        hardware = types.ModuleType("vllm_ascend.device.device_config")
+        hardware.is_950 = lambda: True
+        api = load_definitions(
+            "vllm_ascend/platform.py",
+            {"_validate_flash_mla_config"},
+            VllmConfig=object,
+            torch=torch,
+            envs=NS(VLLM_ASCEND_ENABLE_FLASH_MLA=True),
+            model_uses_sfa_sparse=lambda model: getattr(model, "sparse", False),
+            KVPPConfig=NS(from_vllm_config=lambda cfg: NS(size=1)),
+        )
+        draft = NS(use_mla=True, dtype=torch.bfloat16, sparse=False)
+        spec = NS(method="dspark", enforce_eager=True, draft_model_config=draft, enable_adaptive_verification=False)
+        cfg = NS(
+            model_config=NS(enforce_eager=True, use_mla=True, dtype=torch.bfloat16),
+            use_v2_model_runner=True,
+            cache_config=NS(cache_dtype="auto"),
+            parallel_config=NS(
+                prefill_context_parallel_size=1, decode_context_parallel_size=1, pipeline_parallel_size=1
+            ),
+            speculative_config=spec,
+            kv_transfer_config=None,
+        )
+        with patch.dict(sys.modules, {hardware.__name__: hardware}):
+            api._validate_flash_mla_config(cfg)
+            for obj, field, value in (
+                (spec, "method", "eagle"),
+                (spec, "enforce_eager", False),
+                (spec, "enable_adaptive_verification", True),
+                (spec, "draft_model_config", None),
+                (draft, "use_mla", False),
+                (draft, "sparse", True),
+                (draft, "dtype", torch.float16),
+                (cfg.parallel_config, "pipeline_parallel_size", 2),
+            ):
+                old = getattr(obj, field)
+                setattr(obj, field, value)
+                with self.assertRaises(ValueError):
+                    api._validate_flash_mla_config(cfg)
+                setattr(obj, field, old)
 
 
 if __name__ == "__main__":

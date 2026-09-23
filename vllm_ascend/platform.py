@@ -669,8 +669,21 @@ def _validate_flash_mla_config(vllm_config: VllmConfig) -> None:
         errors.append("PCP/DCP must both be 1")
     if KVPPConfig.from_vllm_config(vllm_config).size != 1:
         errors.append("KV layer parallelism is unsupported")
-    if vllm_config.speculative_config is not None:
-        errors.append("speculative decoding, including DSpark, is not wired")
+    spec = vllm_config.speculative_config
+    if spec is not None:
+        if spec.method != "dspark":
+            errors.append("only DSpark speculative decoding is wired")
+        if not getattr(spec, "enforce_eager", False):
+            errors.append("DSpark enforce_eager=true is required; draft graphs are not wired")
+        draft = getattr(spec, "draft_model_config", None)
+        if draft is None or not draft.use_mla or model_uses_sfa_sparse(draft):
+            errors.append("DSpark draft must use dense MLA")
+        elif draft.dtype != torch.bfloat16:
+            errors.append("DSpark draft dtype must be BF16")
+        if getattr(spec, "enable_adaptive_verification", False):
+            errors.append("DSpark adaptive verification is outside this integration")
+        if parallel.pipeline_parallel_size != 1:
+            errors.append("DSpark FlashMLA currently requires PP=1")
     if vllm_config.kv_transfer_config is not None:
         errors.append("PD/KV transfer is unsupported")
     if errors:

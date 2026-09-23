@@ -19,7 +19,7 @@ from vllm_ascend.attention.flash_mla import (
 )
 
 
-def run_case(heads: int, token_stride: int, query_len: int, kv_len: int):
+def run_case(heads: int, token_stride: int, query_len: int, kv_len: int, causal: bool = True):
     batch, padding, pages_per_req = 2, 2, 3
     pages = batch * pages_per_req
     page_stride = 128 * token_stride + 64
@@ -44,7 +44,7 @@ def run_case(heads: int, token_stride: int, query_len: int, kv_len: int):
         num_actual_tokens=tokens,
         num_input_tokens=tokens + padding,
         max_query_len=query_len,
-        causal=True,
+        causal=causal,
         query_start_loc=torch.tensor([0, query_len, tokens], dtype=torch.int32, device="npu"),
         seq_lens=lens_cpu.to("npu"),
         block_table_tensor=table_cpu.to("npu"),
@@ -78,19 +78,21 @@ def run_case(heads: int, token_stride: int, query_len: int, kv_len: int):
         keys = expected_cache[table_cpu[request].long(), :, 0].reshape(-1, 576)[:length].float()
         q = q_cpu[request * query_len : (request + 1) * query_len].float().transpose(0, 1)
         logits = torch.matmul(q, keys.t()) * scale
-        visible = torch.arange(length)[None, :] <= length - query_len + torch.arange(query_len)[:, None]
-        logits.masked_fill_(~visible[None], float("-inf"))
+        if causal:
+            visible = torch.arange(length)[None, :] <= length - query_len + torch.arange(query_len)[:, None]
+            logits.masked_fill_(~visible[None], float("-inf"))
         expected[:, request * query_len : (request + 1) * query_len] = torch.matmul(logits.softmax(-1), keys[:, :512])
     # The integration masks physical padding before output projection; compare live rows here.
     torch.testing.assert_close(actual[:, :tokens].float().cpu(), expected, atol=0.02, rtol=0.02)
-    print(f"PASS heads={heads} token_stride={token_stride} q={query_len} kv={kv_len}")
+    print(f"PASS heads={heads} token_stride={token_stride} q={query_len} kv={kv_len} causal={causal}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--heads", type=int, choices=(8, 12, 64, 96), default=8)
+    parser.add_argument("--non-causal", action="store_true", help="Check the non-causal MLA DSpark query contract")
     args = parser.parse_args()
     torch.npu.set_device(0)
     for stride in (576, 1152):
         for q_len, kv_len in ((1, 127), (2, 129), (16, 257)):
-            run_case(args.heads, stride, q_len, kv_len)
+            run_case(args.heads, stride, q_len, kv_len, causal=not args.non_causal)

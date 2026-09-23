@@ -1548,11 +1548,29 @@ class AscendMLAImpl(MLAAttentionImpl):
         kv_no_split: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        kv_cache: tuple,
+        kv_cache: torch.Tensor | tuple,
         slots: torch.Tensor,
         *,
         attn_metadata: AscendMLAMetadata | None = None,
     ):
+        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            # DSpark inserts accepted context KV without running query attention.
+            # Keep the cache owner's BBND view, including its page/token strides.
+            validate_flash_cache(kv_cache)
+            tokens = kv_no_split.shape[0]
+            c_kv, k_pe = kv_no_split.reshape(tokens, 1, 576).split([512, 64], dim=-1)
+            c_kv = self.kv_a_layernorm(c_kv.contiguous()).view(tokens, 1, 512)
+            if self.use_mla_rope:
+                k_pe = self.rope_single(k_pe, cos, sin)
+            torch_npu.npu_scatter_pa_kv_cache(
+                key=c_kv.contiguous(),
+                value=k_pe.contiguous(),
+                key_cache=kv_cache[..., :512],
+                value_cache=kv_cache[..., 512:],
+                slot_mapping=slots.to(torch.int64).contiguous(),
+                cache_mode="Norm",
+            )
+            return k_pe, c_kv
         if not self.use_mla_rope:
             return self._exec_kv_no_rope(kv_no_split, kv_cache, slots)
 
