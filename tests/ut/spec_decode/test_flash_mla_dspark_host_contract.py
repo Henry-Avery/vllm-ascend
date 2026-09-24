@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -206,6 +207,10 @@ class DSparkHostContract(unittest.TestCase):
             def set_attn(self, *args):
                 pass
 
+            def propose(self, *args, **kwargs):
+                self.proposals.append((args, kwargs))
+                return "proposed"
+
         contexts = []
 
         @contextmanager
@@ -223,6 +228,7 @@ class DSparkHostContract(unittest.TestCase):
                     "_build_draft_attn_metadata",
                     "build_draft_attn_metadatas",
                     "_update_draft_attn_metadata",
+                    "propose",
                 }
             },
             DSparkSpeculator=Upstream,
@@ -234,6 +240,7 @@ class DSparkHostContract(unittest.TestCase):
             build_draft_attn_metadata_factory=factory,
             dflash_cudagraph=SimpleNamespace(build_attn_metadata=Mock()),
             build_attn_metadata=Mock(return_value={}),
+            device_metadata_context=lambda executor: nullcontext(),
             set_current_vllm_config=lambda cfg: nullcontext(),
             _get_graph_update_backend=lambda groups: groups,
             AscendMLABackend=type("MLA", (), {}),
@@ -244,11 +251,36 @@ class DSparkHostContract(unittest.TestCase):
         spec.num_query_per_req = 5
         spec.input_buffers = SimpleNamespace(positions=torch.arange(32))
         spec.input_batch = SimpleNamespace(num_reqs=1)
+        spec.max_num_reqs = 4
+        spec.max_num_tokens = 20
+        spec.device_metadata_executor = object()
         spec._group_causal = {0: False}
         spec.calls = []
+        spec.proposals = []
         spec.metadata = {}
         spec.contexts = contexts
         return scope, spec
+
+    def test_propose_flash_mla_metadata_matches_capture_without_changing_other_paths(self):
+        flags = np.array([True, False, True, False], dtype=np.bool_)
+        for architecture, flash in (("MLA", True), ("MLA", False), ("GQA", True)):
+            with self.subTest(architecture=architecture, flash=flash):
+                scope, spec = self.spec_scope(architecture, flash)
+                spec.input_batch.is_prefilling_np = flags
+                self.assertEqual(spec.propose(spec.input_batch, *([None] * 10)), "proposed")
+                self.assertEqual(len(spec.proposals), 1)
+                _, runtime_flags, runtime_kwargs = spec.contexts[0]
+                if architecture == "MLA" and flash:
+                    self.assertEqual(runtime_flags.tolist(), [False] * spec.max_num_reqs)
+                    self.assertEqual(runtime_kwargs["attn_state"], "spec")
+                    with spec.draft_capture_context():
+                        scope.dflash_cudagraph.build_attn_metadata(num_tokens=10, num_reqs=2)
+                    capture_kwargs = scope.build_attn_metadata.call_args.kwargs
+                    self.assertEqual(runtime_flags[:2].tolist(), capture_kwargs["is_prefilling"].tolist())
+                    self.assertEqual(runtime_kwargs["attn_state"], capture_kwargs["attn_state"])
+                else:
+                    self.assertEqual(runtime_flags.tolist(), flags.tolist())
+                    self.assertIsNone(runtime_kwargs["attn_state"])
 
     def test_backend_selection_uses_draft_not_target_configuration(self):
         scope, spec = self.spec_scope()
