@@ -16,10 +16,12 @@
 # This file is a part of the vllm-ascend project.
 #
 from collections.abc import Mapping
+from contextlib import contextmanager
 from typing import Any, cast
 
 import numpy as np
 import torch
+import vllm.v1.worker.gpu.spec_decode.dflash.cudagraph as dflash_cudagraph
 from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_dcp_group
@@ -31,13 +33,17 @@ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
     DSparkSpeculator,
 )
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.worker.dcp_utils import DCPManager
+from vllm_ascend.worker.device_metadata import DeviceMetadataExecutor
 from vllm_ascend.worker.v2.aclgraph_utils import _get_graph_update_backend
 from vllm_ascend.worker.v2.attn_utils import (
+    build_attn_metadata,
     build_attn_metadata_wrapper,
     build_draft_attn_metadata_factory,
+    device_metadata_context,
 )
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import prepare_replicated_pcp_config
 
@@ -49,6 +55,8 @@ class AscendDSparkSpeculator(DSparkSpeculator):
         vllm_config, self.replicated_pcp = prepare_replicated_pcp_config(vllm_config)
         super().__init__(vllm_config, device)
         self.input_batch: InputBatch | None = None
+        self.device_metadata_executor = DeviceMetadataExecutor() if ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA else None
+        self._flash_query_metadata = None
         self.attn_architecture: str | None = None
         self._init_dcp()
 
@@ -150,6 +158,32 @@ class AscendDSparkSpeculator(DSparkSpeculator):
             max_model_len=self.max_model_len,
         )
 
+    def _draft_query_attn_state(self):
+        if self.attn_architecture == "MLA" and ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            return AscendAttentionState.SpecDecoding
+        return AscendAttentionState.ChunkedPrefill
+
+    @contextmanager
+    def draft_capture_context(self):
+        """Supply draft query positions and causality to capture-time builders."""
+        if self.attn_architecture != "MLA" or not ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            yield
+            return
+        original = dflash_cudagraph.build_attn_metadata
+
+        def build_query_metadata(*args, **kwargs):
+            kwargs["positions"] = self.input_buffers.positions[: kwargs["num_tokens"]]
+            kwargs["is_prefilling"] = torch.zeros(kwargs["num_reqs"], dtype=torch.bool)
+            kwargs["attn_state"] = self._draft_query_attn_state()
+            kwargs["parallel_config"] = self.attn_vllm_config.parallel_config
+            return build_attn_metadata(*args, **kwargs)
+
+        try:
+            dflash_cudagraph.build_attn_metadata = build_query_metadata
+            yield
+        finally:
+            dflash_cudagraph.build_attn_metadata = original
+
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
         assert self.input_batch is not None
         num_tokens_padded = num_reqs_padded * self.num_query_per_req
@@ -163,7 +197,7 @@ class AscendDSparkSpeculator(DSparkSpeculator):
                 num_tokens_padded,
                 is_prefilling=is_prefilling,
                 seq_lens_cpu=seq_lens_cpu,
-                attn_state=AscendAttentionState.ChunkedPrefill,
+                attn_state=self._draft_query_attn_state(),
                 parallel_config=self.attn_vllm_config.parallel_config,
             ),
         ):
@@ -241,7 +275,7 @@ class AscendDSparkSpeculator(DSparkSpeculator):
                 num_tokens_padded,
                 is_prefilling=is_prefilling,
                 seq_lens_cpu=seq_lens_cpu,
-                attn_state=AscendAttentionState.ChunkedPrefill,
+                attn_state=self._draft_query_attn_state(),
                 parallel_config=self.attn_vllm_config.parallel_config,
             ),
         ):
@@ -307,8 +341,18 @@ class AscendDSparkSpeculator(DSparkSpeculator):
         """Rebuild ``actual_seq_lengths_q`` from the padded request count,
         mirroring Eagle's ``_update_decode_attn_metadata``.
         """
+        if self.attn_architecture == "MLA" and ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            # The current upstream propose path calls _build_uniform_attn_metadata,
+            # not the legacy _build_draft_attn_metadata compatibility entry point.
+            # Keep the exact device boundaries and publish this batch for replay.
+            self._flash_query_metadata = attn_metadata
+            return attn_metadata
         query_lens_list = [(i + 1) * self.num_query_per_req for i in range(num_reqs_padded)]
         for metadata in attn_metadata.values():
+            if getattr(metadata, "flash", None) is not None:
+                # The fresh schedule and device lengths already describe this
+                # draft batch. There is no legacy FIA decode object to update.
+                continue
             decode_metadata = metadata.decode if self.attn_architecture == "MLA" else metadata
             decode_metadata.actual_seq_lengths_q = query_lens_list
         return attn_metadata
@@ -342,12 +386,18 @@ class AscendDSparkSpeculator(DSparkSpeculator):
             # TODO: Remove this guard once main2main includes upstream vLLM
             # #54856 (facd9a74a1), which resets the profiling DP counts.
             sync_state = None
+        uses_flash_mla = self.attn_architecture == "MLA" and ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA
+        self._flash_query_metadata = None
         with (
+            device_metadata_context(self.device_metadata_executor),
             build_attn_metadata_wrapper(),
             build_draft_attn_metadata_factory(
                 self.input_buffers.positions,
                 self.max_num_tokens,
-                torch.from_numpy(self.input_batch.is_prefilling_np),
+                torch.zeros(self.max_num_reqs, dtype=torch.bool)
+                if uses_flash_mla
+                else torch.from_numpy(self.input_batch.is_prefilling_np),
+                attn_state=self._draft_query_attn_state() if uses_flash_mla else None,
                 parallel_config=self.attn_vllm_config.parallel_config,
             ),
         ):

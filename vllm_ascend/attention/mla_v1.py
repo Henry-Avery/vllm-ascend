@@ -25,10 +25,18 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # type: ignore
 from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.flash_mla import (
+    FlashMLAMetadata,
+    build_flash_mla_metadata,
+    init_flash_mla_metadata,
+    run_flash_mla,
+    validate_flash_cache,
+)
 from vllm_ascend.attention.utils import (
     MLAPO_MAX_SUPPORTED_TOKENS,
     AscendCommonAttentionMetadata,
@@ -239,6 +247,7 @@ class AscendMLAMetadata:
     decode: AscendMLADecodeMetadata | None = None
     prefill: AscendMLAPrefillMetadata | None = None
     reshape_cache_event: torch.npu.Event = None
+    flash: FlashMLAMetadata | None = None
 
     def __post_init__(self):
         pass
@@ -332,10 +341,21 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         self.query_lens: torch.Tensor = None
         self.seq_lens: torch.Tensor = None
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            init_flash_mla_metadata(self, static_forward_context[layer_names[0]].impl)
 
     @staticmethod
     def determine_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
         return ascend_chunked_prefill_workspace_size(vllm_config)
+
+    def enable_device_metadata(self) -> None:
+        self._device_metadata_enabled = True
+
+    def take_device_metadata_tasks(self):
+        tasks = self._device_metadata_tasks
+        self._device_metadata_tasks = ()
+        self._device_metadata_enabled = False
+        return tasks
 
     @classmethod
     def get_cudagraph_support(
@@ -473,6 +493,26 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         common_attn_metadata: AscendCommonAttentionMetadata,
         fast_build: bool = False,
     ) -> AscendMLAMetadata:
+        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            common = common_attn_metadata
+            num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
+                common, decode_threshold=self.decode_threshold, treat_short_extends_as_decodes=True
+            )
+            return self.metadata_cls(
+                num_actual_tokens=common.num_actual_tokens,
+                num_input_tokens=common.num_input_tokens,
+                slot_mapping=common.slot_mapping,
+                query_start_loc=common.query_start_loc,
+                seq_lens=common.seq_lens,
+                seq_lens_cpu=None,
+                block_tables=common.block_table_tensor,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+                num_prefills=num_prefills,
+                causal=common.causal,
+                attn_state=common.attn_state,
+                flash=build_flash_mla_metadata(self, common),
+            )
         expanded_slot_mapping = common_attn_metadata.slot_mapping if self.pcp_enabled else None
         num_reqs = common_attn_metadata.num_reqs
         query_start_loc = common_attn_metadata.query_start_loc
@@ -762,6 +802,12 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         return decode_metadata
 
     def build_for_cudagraph_capture(self, common_attn_metadata: AscendCommonAttentionMetadata):
+        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            self._flash_capture = True
+            try:
+                return self.build(0, common_attn_metadata)
+            finally:
+                self._flash_capture = False
         capture_metadata = copy(common_attn_metadata)
         if capture_metadata.attn_state is None:
             capture_metadata.attn_state = AscendAttentionState.ChunkedPrefill
@@ -883,6 +929,16 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.mlapo_num_heads = self.num_heads
         self.mlapo_weight_quant_mode = 3
         self._mlapo_uses_native_weights = False
+        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            if (self.kv_lora_rank, self.qk_rope_head_dim, self.num_kv_heads) != (512, 64, 1):
+                raise ValueError("FlashMLA requires latent=512, rope=64 and one KV head")
+            if self.dtype != torch.bfloat16 or self.fa_quant_layer:
+                raise ValueError("FlashMLA requires BF16 attention and unquantized KV")
+            # Use ordinary projections; no native prolog, C8 or head padding.
+            self.enable_mlapo = False
+            self.enable_kv_nz = False
+            self.num_heads_padded = self.num_heads
+            self.head_padding = 0
 
     @staticmethod
     def update_graph_params(
@@ -893,6 +949,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         speculative_config=None,
         draft_attn_metadatas=None,
     ):
+        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            # MRV2 builds/waits for the device schedule outside the graph.
+            # This legacy hook updates FIA tasks, not FlashMLA input buffers.
+            return
         if _EXTRA_CTX.is_draft_model:
             if _EXTRA_CTX.is_draft_model_prefill:
                 graph_params = get_draft_graph_prefill_params()
@@ -1522,11 +1582,29 @@ class AscendMLAImpl(MLAAttentionImpl):
         kv_no_split: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        kv_cache: tuple,
+        kv_cache: torch.Tensor | tuple,
         slots: torch.Tensor,
         *,
         attn_metadata: AscendMLAMetadata | None = None,
     ):
+        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            # DSpark inserts accepted context KV without running query attention.
+            # Keep the cache owner's BBND view, including its page/token strides.
+            validate_flash_cache(kv_cache)
+            tokens = kv_no_split.shape[0]
+            c_kv, k_pe = kv_no_split.reshape(tokens, 1, 576).split([512, 64], dim=-1)
+            c_kv = self.kv_a_layernorm(c_kv.contiguous()).view(tokens, 1, 512)
+            if self.use_mla_rope:
+                k_pe = self.rope_single(k_pe, cos, sin)
+            torch_npu.npu_scatter_pa_kv_cache(
+                key=c_kv.contiguous(),
+                value=k_pe.contiguous(),
+                key_cache=kv_cache[..., :512],
+                value_cache=kv_cache[..., 512:],
+                slot_mapping=slots.to(torch.int64).contiguous(),
+                cache_mode="Norm",
+            )
+            return k_pe, c_kv
         if not self.use_mla_rope:
             return self._exec_kv_no_rope(kv_no_split, kv_cache, slots)
 
@@ -2115,6 +2193,57 @@ class AscendMLAImpl(MLAAttentionImpl):
     ) -> torch.Tensor:
         raise NotImplementedError("forward_mqa is not supported for MLA attention. Use forward() instead.")
 
+    def _forward_flash(self, layer_name, hidden_states, kv_cache, attn_metadata, output):
+        if output is None:
+            raise ValueError("FlashMLA requires an explicit output buffer")
+        if attn_metadata is None:
+            return output.zero_()  # Memory profiling, no attention inputs.
+        b = attn_metadata.flash
+        t = b.num_tokens
+        if t == 0:
+            return output.zero_()
+        validate_flash_cache(kv_cache)
+        x = hidden_states[:t]
+        if self.layerwise_kv_cache_hook is not None:
+            self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
+        if self.fused_qkv_a_proj is not None:
+            qkv_lora = self.fused_qkv_a_proj(x)[0]
+            q_c, kv = qkv_lora.split([self.q_lora_rank, 576], dim=-1)
+            q_c = self.q_a_layernorm(q_c)
+        else:
+            q_c = x
+            kv = self.kv_a_proj_with_mqa(x)[0]
+        q_abs, q_pe = self._q_proj_and_k_up_proj(q_c)
+        c_kv, k_pe = kv.view(t, 1, 576).split([512, 64], dim=-1)
+        c_kv = self.kv_a_layernorm(c_kv.contiguous()).view(t, 1, 512)
+        if self.use_mla_rope:
+            cos, sin = get_cos_and_sin_mla(b.positions, use_cache=False)
+            q_pe = self.rope_single(q_pe, cos, sin)
+            k_pe = self.rope_single(k_pe, cos, sin)
+        query = torch.cat((q_abs, q_pe), dim=-1)
+        # Both views retain the original page/token stride and storage offset.
+        torch_npu.npu_scatter_pa_kv_cache(
+            key=c_kv.contiguous(),
+            value=k_pe.contiguous(),
+            key_cache=kv_cache[..., :512],
+            value_cache=kv_cache[..., 512:],
+            slot_mapping=b.slots,
+            cache_mode="Norm",
+        )
+        notify_kv_cache_written(layer_name)
+        latent, _ = run_flash_mla(query, kv_cache, b, self.scale)
+        projected = self._v_up_proj(latent)
+        if self.use_output_gate:
+            projected.mul_(torch.sigmoid(self.g_proj(x.contiguous())[0]))
+        # Discard inactive NaN/Inf before the existing projection/TP reduction.
+        projected.masked_fill_(~b.token_live[:, None], 0)
+        result = self.o_proj(projected, is_prefill=b.is_prefill)[0]
+        if result.shape[0] == t:
+            result.masked_fill_(~b.token_live[:, None], 0)
+        output[: result.shape[0]].copy_(result)
+        output[result.shape[0] :].zero_()
+        return output
+
     def forward(
         self,
         layer_name,
@@ -2123,6 +2252,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_metadata: M,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            return self._forward_flash(layer_name, hidden_states, kv_cache, attn_metadata, output)
         assert output is not None, "Output tensor must be provided."
         if attn_metadata is None:
             # Profiling run.
