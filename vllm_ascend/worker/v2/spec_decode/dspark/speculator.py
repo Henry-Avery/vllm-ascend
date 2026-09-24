@@ -247,11 +247,22 @@ class AscendDSparkSpeculator(DSparkSpeculator):
             # TODO: Remove this guard once main2main includes upstream vLLM
             # #54856 (facd9a74a1), which resets the profiling DP counts.
             sync_state = None
+        # Match the MLA draft capture path; runtime CPU prefill flags must not
+        # select a different metadata state after speculative rejection.
+        flash_mla_draft = self.attn_architecture == "MLA" and ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA
+        is_prefilling = (
+            torch.zeros(self.max_num_reqs, dtype=torch.bool)
+            if flash_mla_draft
+            else torch.from_numpy(self.input_batch.is_prefilling_np)
+        )
         with (
             device_metadata_context(self.device_metadata_executor),
             build_attn_metadata_wrapper(),
             build_draft_attn_metadata_factory(
-                self.input_buffers.positions, self.max_num_tokens, torch.from_numpy(self.input_batch.is_prefilling_np)
+                self.input_buffers.positions,
+                self.max_num_tokens,
+                is_prefilling,
+                attn_state=self._draft_query_attn_state() if flash_mla_draft else None,
             ),
         ):
             return super().propose(
