@@ -31,6 +31,7 @@ from vllm.platforms import Platform, PlatformEnum
 # todo: please remove it when solve cuda hard code in vllm
 os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config, init_ascend_config
 from vllm_ascend.device.hardware_profile import (
     AttentionBackendFamily,
@@ -512,6 +513,7 @@ class NPUPlatform(Platform):
 
         # 10.Set pytorch NPU allocator env (vllm_config)
         _set_pytorch_npu_alloc_env(vllm_config)
+        _validate_flash_mla_config(vllm_config)
 
     @classmethod
     def set_additional_forward_context(
@@ -638,6 +640,48 @@ class NPUPlatform(Platform):
             "sinks": sinks,
             "dynamic_mx_quant_scale_alg": dynamic_mx_quant_scale_alg,
         }
+
+
+def _validate_flash_mla_config(vllm_config: VllmConfig) -> None:
+    """Fail closed for combinations outside the BF16 FlashMLA integration."""
+    if not envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+        return
+    from vllm_ascend.device.device_config import is_950
+
+    model = vllm_config.model_config
+    parallel = vllm_config.parallel_config
+    errors = []
+    if not is_950():
+        errors.append("A5 hardware is required")
+    if not vllm_config.use_v2_model_runner:
+        errors.append("MRV2 must be enabled")
+    if not model.use_mla or model_uses_sfa_sparse(model):
+        errors.append("dense MLA is required (not sparse/SFA)")
+    if model.dtype != torch.bfloat16:
+        errors.append("model dtype must be BF16")
+    if vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16", torch.bfloat16):
+        errors.append("KV cache must be unquantized BF16")
+    if parallel.prefill_context_parallel_size != 1 or parallel.decode_context_parallel_size != 1:
+        errors.append("PCP/DCP must both be 1")
+    if KVPPConfig.from_vllm_config(vllm_config).size != 1:
+        errors.append("KV layer parallelism is unsupported")
+    spec = vllm_config.speculative_config
+    if spec is not None:
+        if spec.method != "dspark":
+            errors.append("only DSpark speculative decoding is wired")
+        draft = getattr(spec, "draft_model_config", None)
+        if draft is None or not draft.use_mla or model_uses_sfa_sparse(draft):
+            errors.append("DSpark draft must use dense MLA")
+        elif draft.dtype != torch.bfloat16:
+            errors.append("DSpark draft dtype must be BF16")
+        if getattr(spec, "enable_adaptive_verification", False):
+            errors.append("DSpark adaptive verification is outside this integration")
+        if parallel.pipeline_parallel_size != 1:
+            errors.append("DSpark FlashMLA currently requires PP=1")
+    if vllm_config.kv_transfer_config is not None:
+        errors.append("PD/KV transfer is unsupported")
+    if errors:
+        raise ValueError("VLLM_ASCEND_ENABLE_FLASH_MLA=1: " + "; ".join(errors))
 
 
 def _fix_incompatible_config(vllm_config: VllmConfig) -> None:
