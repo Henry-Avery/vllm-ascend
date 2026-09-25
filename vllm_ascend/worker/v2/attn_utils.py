@@ -45,9 +45,12 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
+from vllm_ascend.attention.flash_mla import FlashMLABuilder
+from vllm_ascend.attention.mla_v1 import AscendMLAMetadataBuilder
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
 from vllm_ascend.attention.utils import (
     MLA_FLASH_SUPPORTED_Q_HEADS,
@@ -378,6 +381,16 @@ def build_attn_metadata(
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
+            if envs.VLLM_ASCEND_ENABLE_FLASH_MLA and type(attn_metadata_builder) is AscendMLAMetadataBuilder:
+                if metadata.num_decodes:
+                    flash_builder = getattr(attn_metadata_builder, "_flash_mla_builder", None)
+                    if flash_builder is None:
+                        impl = attn_metadata_builder.vllm_config.compilation_config.static_forward_context[
+                            attn_group.layer_names[0]
+                        ].impl
+                        flash_builder = FlashMLABuilder(impl.num_heads, seq_lens.device)
+                        attn_metadata_builder._flash_mla_builder = flash_builder
+                    metadata.flash_mla = flash_builder.build(common_attn_metadata, metadata, num_actual_reqs)
             if is_dsa_builder:
                 # Preserve sharing even if a builder replaces one of the
                 # dictionaries while constructing its metadata.
@@ -1190,13 +1203,8 @@ def _reshape_kv_cache_v2(
 
             single_raw_mla_cache = get_single_raw_mla_backing(raw_cache)
 
-            if (
-                single_raw_mla_cache is not None
-                and _uses_single_raw_mla_cache(vllm_config, layer_name, kv_cache_spec)
-            ):
-                attn_module = get_layers_from_vllm_config(
-                    vllm_config, AttentionLayerBase, [layer_name]
-                )[layer_name]
+            if single_raw_mla_cache is not None and _uses_single_raw_mla_cache(vllm_config, layer_name, kv_cache_spec):
+                attn_module = get_layers_from_vllm_config(vllm_config, AttentionLayerBase, [layer_name])[layer_name]
                 kernel_blocks_per_manager = kv_cache_spec.block_size // kernel_block_size
                 slot_bytes = kv_cache_spec.page_size_bytes // kernel_blocks_per_manager
                 component_shape = (
@@ -1236,10 +1244,7 @@ def _reshape_kv_cache_v2(
                     kv_cache_spec.dtype,
                     slot_bytes,
                     offset_bytes=(
-                        kernel_block_size
-                        * kv_cache_spec.num_kv_heads
-                        * nope_dim
-                        * get_dtype_size(kv_cache_spec.dtype)
+                        kernel_block_size * kv_cache_spec.num_kv_heads * nope_dim * get_dtype_size(kv_cache_spec.dtype)
                     ),
                 )
                 kv_caches[layer_name] = (nope_cache, rope_cache)

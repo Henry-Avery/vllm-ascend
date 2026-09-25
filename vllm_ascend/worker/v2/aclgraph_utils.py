@@ -162,6 +162,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         )
         self.breakable_cg_runner: BreakableACLGraphWrapper | None = None
         self.model_runner = model_runner
+        self.flash_mla_graph_inputs: dict[tuple[int, int], dict[str, Any]] = {}
         self.update_stream = self.model_runner.update_stream
         self.capture_sizes = collect_sorted_captured_token_sizes(self._capture_descs)
         if super().needs_capture():
@@ -178,6 +179,16 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         with set_current_vllm_config(self.vllm_config):
             attn_backend = _get_graph_update_backend(self.model_runner.attn_groups)
         attn_metadata = self.model_runner.model_state.attn_metadata
+        flash_inputs = {k: m.flash_mla for k, m in attn_metadata.items() if getattr(m, "flash_mla", None) is not None}
+        expected = self.flash_mla_graph_inputs.get((desc.num_tokens, desc.num_reqs))
+        if flash_inputs or expected is not None:
+            if expected is None or expected.keys() != flash_inputs.keys():
+                raise RuntimeError("FlashMLA replay does not match the captured attention groups")
+            for key, flash in flash_inputs.items():
+                if flash is not expected[key]:
+                    raise RuntimeError("FlashMLA replay must refresh the captured buffers, not replace them")
+                if flash.execution_stream != torch.npu.current_stream():
+                    raise RuntimeError("FlashMLA replay must use the metadata preparation stream")
 
         if use_updatable_graph(attn_backend):
             return self._updatable_graph_replay(desc, attn_metadata)
@@ -249,7 +260,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         pcp_manager: Any = None,
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
-        model = ModelWithContext(model)
+        model = ModelWithContext(model, flash_mla_graph_inputs=self.flash_mla_graph_inputs)
         pcp_manager = getattr(self.model_runner, "pcp_manager", None)
         if pcp_manager is not None:
             cudagraph_utils.prepare_inputs_to_capture = partial(
@@ -278,11 +289,12 @@ class ModelWithContext(nn.Module):
     so we can inherit vllm's CudaGraphManager._capture_full_graph.
     """
 
-    def __init__(self, original_model, is_draft_model=False, is_draft_model_prefill=False):
+    def __init__(self, original_model, is_draft_model=False, is_draft_model_prefill=False, flash_mla_graph_inputs=None):
         super().__init__()
         self.original_model = original_model
         self.is_draft_model = is_draft_model
         self.is_draft_model_prefill = is_draft_model_prefill
+        self.flash_mla_graph_inputs = flash_mla_graph_inputs
 
     def forward(self, *args, **kwargs):
         forward_context = get_forward_context()
@@ -296,6 +308,23 @@ class ModelWithContext(nn.Module):
             _EXTRA_CTX.is_draft_model = True
         if self.is_draft_model_prefill:
             _EXTRA_CTX.is_draft_model_prefill = True
+
+        if _EXTRA_CTX.capturing and self.flash_mla_graph_inputs is not None:
+            flash_inputs = {
+                k: m.flash_mla
+                for k, m in forward_context.attn_metadata.items()
+                if getattr(m, "flash_mla", None) is not None
+            }
+            if flash_inputs:
+                flash = next(iter(flash_inputs.values()))
+                key = (flash.token_live.shape[0], flash.cache_lens.shape[0])
+                previous = self.flash_mla_graph_inputs.get(key)
+                if previous is not None and (
+                    previous.keys() != flash_inputs.keys()
+                    or any(previous[name] is not value for name, value in flash_inputs.items())
+                ):
+                    raise RuntimeError("FlashMLA capture cannot rebind an existing graph bucket")
+                self.flash_mla_graph_inputs[key] = flash_inputs
 
         return self.original_model(*args, **kwargs)
 
