@@ -81,6 +81,7 @@ from vllm_ascend.worker.utils import (
     make_page_strided_cache_view,
     mla_spec_supports_single_raw_backing,
 )
+from vllm_ascend.worker.v2.flash_mla_metadata import get_device_metadata_executor
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
@@ -261,6 +262,12 @@ def build_attn_metadata(
     causal: bool | Mapping[int, bool] = True,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
+    executor = get_device_metadata_executor()
+    if executor is not None and executor.submission_in_flight:
+        # Warmup/capture factories can prepare another batch in one context,
+        # after the previous consumer has been queued on this stream.
+        executor.release()
+    device_metadata_tasks = []
     # TODO(Ronald1995): optimize AscendCommonAttentionMetadata.
     # seq_lens_np is used for ascend npus, it maybe None in spec_decode case,
     # we fill it with max_seq_len in case `attn_metadata_builder.build` raise
@@ -390,13 +397,22 @@ def build_attn_metadata(
                         ].impl
                         flash_builder = FlashMLABuilder(impl.num_heads, seq_lens.device)
                         attn_metadata_builder._flash_mla_builder = flash_builder
-                    metadata.flash_mla = flash_builder.build(common_attn_metadata, metadata, num_actual_reqs)
+                    if executor is None:
+                        raise RuntimeError("FlashMLA requires the MRV2 device metadata context")
+                    metadata.flash_mla = flash_builder.build(
+                        common_attn_metadata, metadata, num_actual_reqs, device_metadata_tasks
+                    )
             if is_dsa_builder:
                 # Preserve sharing even if a builder replaces one of the
                 # dictionaries while constructing its metadata.
                 common_ratio_to_sas_metadata = attn_metadata_builder.common_ratio_to_sas_metadata  # type: ignore[assignment]
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
+    if device_metadata_tasks:
+        assert executor is not None
+        executor.submit(device_metadata_tasks)
+        for task in device_metadata_tasks:
+            executor.wait(task.group_id)
     return attn_metadata
 
 

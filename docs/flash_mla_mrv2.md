@@ -13,8 +13,9 @@ Weight quantization is separate from attention/cache quantization.
 
 ## Scope and data contract
 
-- Queries of up to 16 tokens use the decode path. Longer prefill and mixed
-  batches' prefill suffix retain the existing mainline implementation.
+- Mainline decode/prefill classification is retained (threshold 1 without
+  speculative decoding). The operator's 1-16 query-length contract does not
+  reclassify short prefills. Mixed batches retain the mainline prefill suffix.
 - The original runner-owned cache is `[pages, 128, 1, 576]`, `PA_BBND`.
   Page/token strides may include gaps; nonzero storage offsets are retained.
   The consumer does not compact, allocate, zero or copy the KV cache. Cache
@@ -40,13 +41,20 @@ and keyed by batch capacity, token capacity, page-table width and causality.
 The external operator's Meta output determines the exact schedule capacity;
 an incompatible runtime output raises before copying it.
 
-Device input preparation, schedule generation, forward/replay, and subsequent
-reuse run in order on the execution stream. When vLLM switches between its
-capture and execution streams, the new preparation stream waits for the old
-one before overwriting any buffer. The consumer must use the preparation
-stream. FULL capture records group-to-buffer identities; replay checks those
-identities before launching the graph. This intentionally serializes metadata
-and attention; it does not implement cross-stream overlap.
+The worker owns a metadata executor, adapted from reference `de31c53d`'s
+MRV2 lifecycle. The metadata stream waits for model-stream inputs and the
+previous consumer's reuse fence, then refreshes inputs and generates schedules.
+The model stream waits on ordinary ready events outside graph capture/replay.
+After consumers are queued, the context records a reuse fence. Warmup/capture
+factories can release the previous submission before preparing another batch.
+Partial submission failures join queued metadata work before release; input
+tensors record their use on the metadata stream to protect allocation lifetime.
+
+FULL capture records buffer identities and tensor storage/layout signatures;
+replay checks them before launching the graph. FULL support remains decode-only.
+No ExternalEvent branch, draft executor or DCP merge is introduced.
+The scoped executor lives in `worker/v2/flash_mla_metadata.py`; mainline's
+`worker/device_metadata.py` and its existing users remain unchanged.
 
 The legacy FIA graph updater skips only target entries carrying FlashMLA
 metadata. Other backends and draft paths retain their updater behavior.
@@ -61,9 +69,10 @@ python tests/ut/attention/test_external_flash_mla.py
 ```
 
 These tests use real CPU tensors and spy operators/streams, and execute the
-actual forward and graph-binding methods in isolation. They cover layout,
+actual runner preparation, forward and graph-binding methods in isolation. They cover layout,
 strides, offsets, shared arguments, lengths, padding, metadata capacity,
-buffer reuse, scope guards and mixed-prefill postprocessing. They do **not**
+buffer reuse, side-stream event ordering, exception release, request reordering,
+cross-page writes, padding output reuse and mixed-prefill postprocessing. They do **not**
 prove the external binary ABI, numerical accuracy, actual ACL Graph capture,
 GE/compilation compatibility, cache-writer kernel correctness, or performance.
 

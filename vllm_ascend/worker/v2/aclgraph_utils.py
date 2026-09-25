@@ -50,6 +50,7 @@ from vllm_ascend.compilation.updatable_graph import (
     UpdatableGraph,
 )
 from vllm_ascend.utils import use_updatable_graph
+from vllm_ascend.worker.v2.flash_mla_metadata import device_metadata_context
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.utils import communicator_switch
 
@@ -185,10 +186,11 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             if expected is None or expected.keys() != flash_inputs.keys():
                 raise RuntimeError("FlashMLA replay does not match the captured attention groups")
             for key, flash in flash_inputs.items():
-                if flash is not expected[key]:
+                captured, binding = expected[key]
+                if flash is not captured or flash.binding() != binding:
                     raise RuntimeError("FlashMLA replay must refresh the captured buffers, not replace them")
                 if flash.execution_stream != torch.npu.current_stream():
-                    raise RuntimeError("FlashMLA replay must use the metadata preparation stream")
+                    raise RuntimeError("FlashMLA replay must use the stream that waits for metadata")
 
         if use_updatable_graph(attn_backend):
             return self._updatable_graph_replay(desc, attn_metadata)
@@ -267,7 +269,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 _prepare_pcp_inputs_to_capture,
                 pcp_manager=pcp_manager,
             )
-        with communicator_switch():
+        with communicator_switch(), device_metadata_context(self.model_runner.device_metadata_executor):
             return super().capture(
                 model,
                 model_state,
@@ -321,10 +323,15 @@ class ModelWithContext(nn.Module):
                 previous = self.flash_mla_graph_inputs.get(key)
                 if previous is not None and (
                     previous.keys() != flash_inputs.keys()
-                    or any(previous[name] is not value for name, value in flash_inputs.items())
+                    or any(
+                        previous[name][0] is not value or previous[name][1] != value.binding()
+                        for name, value in flash_inputs.items()
+                    )
                 ):
                     raise RuntimeError("FlashMLA capture cannot rebind an existing graph bucket")
-                self.flash_mla_graph_inputs[key] = flash_inputs
+                self.flash_mla_graph_inputs[key] = {
+                    name: (value, value.binding()) for name, value in flash_inputs.items()
+                }
 
         return self.original_model(*args, **kwargs)
 

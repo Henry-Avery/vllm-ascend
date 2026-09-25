@@ -305,8 +305,6 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
                 got {self.decode_threshold}"
             )
 
-        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
-            self.decode_threshold = 16
         self.reorder_batch_threshold = self.decode_threshold
         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
         # mla_nope_zero_rope_cache: MLA-NoPE models (qk_rope_head_dim == 0) feed
