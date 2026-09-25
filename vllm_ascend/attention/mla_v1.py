@@ -25,10 +25,12 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # type: ignore
 from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.flash_mla import FlashMLAMetadata, flash_mla_decode, validate_flash_mla_config
 from vllm_ascend.attention.utils import (
     MLAPO_MAX_SUPPORTED_TOKENS,
     AscendCommonAttentionMetadata,
@@ -238,6 +240,7 @@ class AscendMLAMetadata:
 
     decode: AscendMLADecodeMetadata | None = None
     prefill: AscendMLAPrefillMetadata | None = None
+    flash_mla: FlashMLAMetadata | None = None
     reshape_cache_event: torch.npu.Event = None
 
     def __post_init__(self):
@@ -875,6 +878,14 @@ class AscendMLAImpl(MLAAttentionImpl):
         # may be a quantization rollback layer.
         if not self.fa_quant_layer:
             self.dtype = self.vllm_config.model_config.dtype
+        self.use_flash_mla = envs.VLLM_ASCEND_ENABLE_FLASH_MLA
+        if self.use_flash_mla:
+            validate_flash_mla_config(self)
+            if not get_current_hardware_profile().supports(HardwareCapability.MLA_FLASH):
+                raise ValueError("External FlashMLA requires the token-fused MLA cache hardware profile")
+            # The dependency's fused BBND cache already excludes decode prolog.
+            # Keep unfused projection weights alive for its existing KV writer.
+            self.enable_mlapo = False
         # For models whose num_heads is not a power of 2 (e.g., GLM-4.7-Flash
         # with 20 heads), ascend attention ops require padding heads to the
         # next power of 2.
@@ -907,7 +918,12 @@ class AscendMLAImpl(MLAAttentionImpl):
         else:
             graph_params = get_graph_params()
             attn_metadata = forward_context.attn_metadata
-            attn_keys = [k for k in attn_metadata if getattr(attn_metadata[k], "decode", None) is not None]
+            attn_keys = [
+                k
+                for k in attn_metadata
+                if getattr(attn_metadata[k], "decode", None) is not None
+                and getattr(attn_metadata[k], "flash_mla", None) is None
+            ]
         # FIXME: Behold! We are using a temporary hack here to update the args
         # for each layer's attention op in the graph.
         num_layers = len(attn_keys)
@@ -2139,6 +2155,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         # Fused MLA cache由runner保存为单一tensor。旧MLA实现仍按
         # nope/rope两个logical tensor访问算子，因此在这里做零拷贝切片。
         fused_mla_cache = isinstance(kv_cache, torch.Tensor)
+        raw_mla_cache = kv_cache
+        flash = attn_metadata.flash_mla
+        if self.use_flash_mla and attn_metadata.num_decodes and flash is None:
+            raise RuntimeError("MRV2 must prepare external FlashMLA metadata before forward/replay")
         if isinstance(kv_cache, torch.Tensor):
             kv_cache = (
                 kv_cache[..., : self.kv_lora_rank],
@@ -2179,7 +2199,17 @@ class AscendMLAImpl(MLAAttentionImpl):
             )
         if decode_preprocess_res is not None:
             # MLA Preprocess for decoding
-            output_decode = self._forward_decode(decode_preprocess_res, kv_cache[0].shape[1], attn_metadata)
+            if flash is not None:
+                latent = flash_mla_decode(
+                    decode_preprocess_res.ql_nope,
+                    decode_preprocess_res.q_pe,
+                    raw_mla_cache,
+                    flash,
+                    self.scale,
+                )
+                output_decode = self._v_up_proj(latent)
+            else:
+                output_decode = self._forward_decode(decode_preprocess_res, kv_cache[0].shape[1], attn_metadata)
 
             o_proj_input[:num_decode_tokens] = output_decode
 
@@ -2200,6 +2230,10 @@ class AscendMLAImpl(MLAAttentionImpl):
             o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
         if gate is not None:
             o_proj_input.mul_(torch.sigmoid(gate))
+        if flash is not None and prefill_preprocess_res is None:
+            # Captured forwards include physical padding rows; remove even NaNs
+            # from the gate before projection/TP reduction.
+            o_proj_input[: flash.token_live.shape[0]].masked_fill_(~flash.token_live[:, None], 0)
         # O proj
         output[...] = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
 

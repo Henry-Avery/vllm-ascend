@@ -36,6 +36,10 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # External cann_ops_transformer FlashMLA for MRV2 target decode/short Q.
+    # Default: 0; valid values: 0/1; not sensitive. Requires unquantized BBND,
+    # DCP=PCP=1 and speculative decoding disabled.
+    "VLLM_ASCEND_ENABLE_FLASH_MLA": lambda: _strict_binary_env("VLLM_ASCEND_ENABLE_FLASH_MLA"),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
