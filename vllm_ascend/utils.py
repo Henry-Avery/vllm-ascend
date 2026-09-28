@@ -801,6 +801,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     from vllm_ascend.ops.rotary_embedding import (
         AscendApplyRotaryEmb,
         AscendDeepseekScalingRotaryEmbedding,
+        AscendGemma4RotaryEmbedding,
         AscendMRotaryEmbedding,
         AscendRotaryEmbedding,
         AscendYaRNRotaryEmbedding,
@@ -817,6 +818,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         "SiluAndMul": AscendSiluAndMul,
         "SiluAndMulClamp": AscendSiluAndMulWithClamp,
         "RotaryEmbedding": AscendRotaryEmbedding,
+        "Gemma4RotaryEmbedding": AscendGemma4RotaryEmbedding,
         "MRotaryEmbedding": AscendMRotaryEmbedding,
         "ColumnParallelLinear": AscendColumnParallelLinear,
         "RowParallelLinear": AscendRowParallelLinear,
@@ -1779,3 +1781,14 @@ def use_updatable_graph(
     from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 
     return attn_backend is not None and issubclass(attn_backend, AscendAttentionBackend)
+
+
+def _is_glm_model(model_config) -> bool:
+    """Return True if the target model belongs to the GLM series.
+
+    Detection is based on the model_type string (covers glm, chatglm, glm4,
+    glm4_moe, glm4_moe_lite, glm4_1v, glm_ocr, glm_moe_dsa, etc).
+    """
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    model_type = getattr(hf_text_config, "model_type", "") or ""
+    return "glm" in str(model_type).lower()
