@@ -36,6 +36,7 @@ from vllm_ascend.attention.utils import (
     wait_for_kv_layer_from_connector,
 )
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, get_storage_block_size
+from vllm_ascend.device.device_config import is_950
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
@@ -62,6 +63,9 @@ if TYPE_CHECKING:
 # =============================================================================
 # Legacy DSA-CP implementation (TP/SP group)
 # =============================================================================
+
+# Fixed-size contract required by the underlying _C_ascend ops (must be exactly 1024).
+SAS_METADATA_SIZE = 1024
 
 
 def restore_tp_heads(output, tp_group):
@@ -271,29 +275,31 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     torch.bfloat16
                 ),
             )
-        self.start_pos_prefill = torch.zeros(scheduler_config.max_num_seqs, dtype=torch.int32, device=self.device)
-        self.req_sas_metadata = torch.zeros(1024, dtype=torch.int32, device=self.device)
-        self.req_qli_metadata = torch.zeros(1024, dtype=torch.int32, device=self.device)
         # Full-decode graphs pad the request count beyond max_num_seqs
-        # (cudagraph capture sizes plus the FIA dummy request), so size the
-        # per-request QLI buffers for the graph-mode maximum.
-        max_qli_reqs = scheduler_config.max_num_seqs
+        # (cudagraph capture sizes plus the FIA dummy request), so size all
+        # per-request buffers for the graph-mode maximum. Otherwise the
+        # [:num_reqs] views taken below get truncated, copy_() into them
+        # fails with shape mismatches, or triton kernels write past the
+        # buffer end and corrupt adjacent device memory.
         compilation_config = self.vllm_config.compilation_config
+        max_padded_reqs = scheduler_config.max_num_seqs
         if compilation_config.cudagraph_mode != CUDAGraphMode.NONE and compilation_config.cudagraph_capture_sizes:
-            max_qli_reqs = max(max_qli_reqs, compilation_config.max_cudagraph_capture_size)
+            max_padded_reqs = max(max_padded_reqs, compilation_config.max_cudagraph_capture_size)
         # +1 holds the FIA dummy request inserted by mixed-batch padding.
-        self.qli_seqused_k = torch.zeros(max_qli_reqs + 1, dtype=torch.int32, device=self.device)
-        self.qli_cmp_residual_k = torch.zeros(max_qli_reqs + 1, dtype=torch.int32, device=self.device)
+        max_padded_reqs += 1
+        self.start_pos_prefill = torch.zeros(max_padded_reqs, dtype=torch.int32, device=self.device)
+        self.req_sas_metadata = torch.zeros(SAS_METADATA_SIZE, dtype=torch.int32, device=self.device)
+        self.req_qli_metadata = torch.zeros(SAS_METADATA_SIZE, dtype=torch.int32, device=self.device)
+        self.qli_seqused_k = torch.zeros(max_padded_reqs, dtype=torch.int32, device=self.device)
+        self.qli_cmp_residual_k = torch.zeros(max_padded_reqs, dtype=torch.int32, device=self.device)
         self._device_metadata_enabled = False
         self._device_metadata_tasks: tuple[DeviceMetadataTask, ...] = ()
         self.cu_seqlens_ori_kv = torch.tensor([], device=self.device)
         self.cu_seqlens_cmp_kv = torch.tensor([], device=self.device)
         self.seqused_q = torch.tensor([], device=self.device)
         self._zero_i32 = torch.tensor([0], device=self.device, dtype=torch.int32)
-        self.local_query_start_loc = torch.zeros(
-            scheduler_config.max_num_seqs + 1, dtype=torch.int32, device=self.device
-        )
-        self.local_seq_lens = torch.zeros(scheduler_config.max_num_seqs, dtype=torch.int32, device=self.device)
+        self.local_query_start_loc = torch.zeros(max_padded_reqs + 1, dtype=torch.int32, device=self.device)
+        self.local_seq_lens = torch.zeros(max_padded_reqs, dtype=torch.int32, device=self.device)
 
         self.speculative_config = vllm_config.speculative_config
         self.decode_threshold = 1
@@ -310,12 +316,16 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 for _ in range(spec_token_num)
             ]
             self.spec_local_query_start_loc = [
-                torch.zeros(scheduler_config.max_num_seqs + 1, dtype=torch.int32, device=self.device)
-                for _ in range(spec_token_num)
+                torch.zeros(max_padded_reqs + 1, dtype=torch.int32, device=self.device) for _ in range(spec_token_num)
             ]
             self.spec_local_seq_lens = [
-                torch.zeros(scheduler_config.max_num_seqs, dtype=torch.int32, device=self.device)
-                for _ in range(spec_token_num)
+                torch.zeros(max_padded_reqs, dtype=torch.int32, device=self.device) for _ in range(spec_token_num)
+            ]
+            self.spec_sas_metadata = [
+                torch.zeros(SAS_METADATA_SIZE, dtype=torch.int32, device=self.device) for _ in range(spec_token_num)
+            ]
+            self.spec_start_pos = [
+                torch.zeros(max_padded_reqs, dtype=torch.int32, device=self.device) for _ in range(spec_token_num)
             ]
             self.decode_threshold += spec_token_num
             assert self.decode_threshold <= 16, (
@@ -339,6 +349,19 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # Explicit override in case the underlying builder specialized this getter.
         # @override omitted only because of mypy limitation due to type variable.
         return AttentionCGSupport.UNIFORM_BATCH
+
+    def build_for_cudagraph_capture(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+        **kwargs,
+    ) -> AscendDSAMetadata:
+        # Upstream capture calls this without Ascend kwargs. Forward the shared
+        # DSA cache that Model Runner V2 passes for legacy DSA-CP builders.
+        return self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+            **kwargs,
+        )
 
     def build(
         self,
@@ -447,6 +470,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         **kwargs,
     ) -> AscendDSAMetadata:
         assert self.compressor_ratio <= 1, "vLLM-Ascend only support SWA-layer for Deepseek-V4 now."
+        # NOTE(Csrayz): num_reqs here is the padded token count from graph dispatch
         num_reqs = common_attn_metadata.num_reqs
         num_input_tokens = common_attn_metadata.num_input_tokens
         # Cross-kv-cache-group metadata cache. The spec-decode proposer passes
@@ -480,9 +504,10 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 treat_short_extends_as_decodes=False,
             )
             input_positions = common_attn_metadata.positions[:num_input_tokens].long()
-            # Draft steps update positions independently. Reusing the global RoPE
-            # cache can let later draft steps overwrite step-0 metadata.
-            cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=False)
+            # Use per-draft-index RoPE buffer so tensor addresses stay stable
+            # across graph capture/replay; the per-step cache below then lets
+            # sibling kv-cache groups reuse the same stable tensors.
+            cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=True, draft_index=draft_index)
             if metadata_cache is not None:
                 metadata_cache.update(
                     num_decodes=num_decodes,
@@ -510,6 +535,13 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             self.seq_lens_cpu = self.seq_lens.cpu()
             if metadata_cache is not None:
                 metadata_cache["seq_lens_cpu"] = self.seq_lens_cpu
+        # In aclgraph mode num_reqs is the padded request count; keep the
+        # tensor's batch dim stable at num_reqs across capture and replay.
+        num_real_reqs = self.seq_lens_cpu.shape[0]
+        if num_real_reqs < num_reqs:
+            self.seq_lens_cpu = F.pad(self.seq_lens_cpu, (0, num_reqs - num_real_reqs))
+        else:
+            self.seq_lens_cpu = self.seq_lens_cpu[:num_reqs]
 
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
 
@@ -567,19 +599,25 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         if metadata_cache is not None and "local_query_start_loc" in metadata_cache:
             # Hit: local token metadata computed by a sibling kv-cache group
-            # of the same draft step. Values are identical across groups, so
-            # the cached (cloned) tensors are reused directly.
+            # of the same draft step. Values are identical across groups; copy
+            # them into this builder's stable per-draft buffers so the returned
+            # views keep fixed addresses across aclgraph capture/replay.
             local_start = metadata_cache["local_start"]
             local_end_with_pad = metadata_cache["local_end_with_pad"]
             tokens_per_rank = metadata_cache["tokens_per_rank"]
             num_tokens_pad = metadata_cache["num_tokens_pad"]
-            local_query_start_loc = metadata_cache["local_query_start_loc"]
-            local_seq_lens = metadata_cache["local_seq_lens"]
             max_local_query_len = metadata_cache["max_local_query_len"]
             max_local_seq_lens = metadata_cache["max_local_seq_lens"]
             local_cos = metadata_cache["local_cos"]
             local_sin = metadata_cache["local_sin"]
-            start_pos = metadata_cache["start_pos"]
+            self.spec_local_query_start_loc[draft_index - 1][: num_reqs + 1].copy_(
+                metadata_cache["local_query_start_loc"]
+            )
+            self.spec_local_seq_lens[draft_index - 1][:num_reqs].copy_(metadata_cache["local_seq_lens"])
+            self.spec_start_pos[draft_index - 1][:num_reqs].copy_(metadata_cache["start_pos"])
+            local_query_start_loc = self.spec_local_query_start_loc[draft_index - 1][: num_reqs + 1]
+            local_seq_lens = self.spec_local_seq_lens[draft_index - 1][:num_reqs]
+            start_pos = self.spec_start_pos[draft_index - 1][:num_reqs]
         else:
             (
                 local_start,
@@ -597,8 +635,11 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 local_seq_lens=self.spec_local_seq_lens[draft_index - 1],
                 is_noncausal=is_noncausal,
             )
-            local_query_start_loc = local_query_start_loc.clone()
-            local_seq_lens = local_seq_lens.clone()
+            # NOTE: no .clone() here. ACL graph capture bakes the addresses of
+            # these tensors into the draft graph, so every replay must read the
+            # freshly built values from the same (stable) buffer addresses.
+            # Returning a fresh clone would leave the graph reading stale
+            # capture-time metadata and cause illegal device memory accesses.
             local_cos = cos.pad_to(num_tokens_pad)[local_start:local_end_with_pad]
             local_sin = sin.pad_to(num_tokens_pad)[local_start:local_end_with_pad]
 
@@ -613,21 +654,24 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             max_local_query_len = max(1, int(local_seq_lens_q_cpu.max().item()))
             max_local_seq_lens = max(1, int(local_seq_lens_cpu.max().item()))
 
-            start_pos = self.seq_lens[:num_reqs] - seq_lens_q
+            start_pos = self.spec_start_pos[draft_index - 1][:num_reqs]
+            start_pos.copy_(self.seq_lens[:num_reqs] - seq_lens_q)
 
             if metadata_cache is not None:
+                # Store value snapshots: the persistent buffers are refilled on
+                # every step, so sibling groups must copy the values now.
                 metadata_cache.update(
                     local_start=local_start,
                     local_end_with_pad=local_end_with_pad,
                     tokens_per_rank=tokens_per_rank,
                     num_tokens_pad=num_tokens_pad,
-                    local_query_start_loc=local_query_start_loc,
-                    local_seq_lens=local_seq_lens,
+                    local_query_start_loc=local_query_start_loc.clone(),
+                    local_seq_lens=local_seq_lens.clone(),
                     max_local_query_len=max_local_query_len,
                     max_local_seq_lens=max_local_seq_lens,
                     local_cos=local_cos,
                     local_sin=local_sin,
-                    start_pos=start_pos,
+                    start_pos=start_pos.clone(),
                 )
 
         dspark_swa_indices = None
@@ -718,6 +762,11 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     sas_head_dim=head_dim,
                     sas_metadata=sas_metadata,
                 )
+        # Cache sas_metadata in the per-draft-index buffer so the tensor
+        # address stays stable across aclgraph capture/replay, regardless of
+        # whether it came from the device metadata kernel or a sibling group.
+        self.spec_sas_metadata[draft_index - 1][:SAS_METADATA_SIZE].copy_(sas_metadata[:SAS_METADATA_SIZE])
+        sas_metadata = self.spec_sas_metadata[draft_index - 1]
 
         cp_metadata = DSACPMetadata(
             local_query_start_loc=local_query_start_loc,
@@ -1276,8 +1325,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
             metadata = metadata_op(**kw)
         self.common_ratio_to_sas_metadata[cache_key] = metadata
-        self.req_sas_metadata[:1024] = metadata
-        return self.req_sas_metadata[:1024]
+        self.req_sas_metadata[:SAS_METADATA_SIZE] = metadata
+        return self.req_sas_metadata[:SAS_METADATA_SIZE]
 
     def _build_qli_metadata(
         self,
@@ -1326,8 +1375,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 device=str(self.seqused_q.device),
             )
         self.common_ratio_to_sas_metadata[cache_key] = metadata
-        self.req_qli_metadata[:1024] = metadata
-        return self.req_qli_metadata[:1024]
+        self.req_qli_metadata[:SAS_METADATA_SIZE] = metadata
+        return self.req_qli_metadata[:SAS_METADATA_SIZE]
 
     def build_for_graph_capture(
         self,
@@ -1409,9 +1458,9 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
         self.wo_a = kwargs["wo_a"]
         self.wo_b = kwargs["wo_b"]
 
-        # Device-independent: the selected linear method validates whether
-        # its tensors support domain/full-weight switching.
-        self.enable_dsa_cp_full_o_proj = enable_dsa_cp_full_o_proj()
+        # A5 uses full o_proj weight gathering. A3 keeps the activation
+        # all-to-all path to avoid gathering the full o_proj weights.
+        self.enable_dsa_cp_full_o_proj = enable_dsa_cp_full_o_proj() and is_950()
         self.o_proj_weight_switch_config = WeightSwitchConfig.from_group(self.tp_group)
         self._o_proj_weight_switch_enabled = False
 
@@ -1518,6 +1567,18 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
             )
         if self.enable_dsa_cp_full_o_proj:
             self._enable_o_proj_full_weight_switch()
+
+    @staticmethod
+    def update_graph_params(
+        update_stream,
+        forward_context,
+        num_tokens,
+        vllm_config=None,
+        speculative_config=None,
+        draft_attn_metadatas=None,
+    ):
+        # DSA-CP does not need to update graph params.
+        pass
 
     @staticmethod
     def _get_weight_switch_method(layer: torch.nn.Module) -> WeightSwitchMixin:
@@ -1665,8 +1726,6 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
         }
-        if need_gather_q_kv and self.tp_size > 1 and not is_decode and not self.enable_dsa_cp_full_o_proj:
-            raise RuntimeError("DSA-CP sequence-parallel prefill requires full o_proj weight gathering.")
         full_gather_wo_a_enabled = self.tp_size > 1 and self.enable_dsa_cp_full_o_proj and not is_decode
         local_attn_output = self._forward(
             layer_name,
@@ -1688,7 +1747,7 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
         if full_gather_wo_a_enabled:
             self._switch_o_proj_to_full_weight()
         try:
-            projected_output = self._forward_o_proj(o_proj_input, full_gather_wo_a_enabled)
+            projected_output = self._forward_o_proj(o_proj_input, full_gather_wo_a_enabled=full_gather_wo_a_enabled)
             if need_gather_q_kv and not full_gather_wo_a_enabled:
                 projected_output = sp_reduce_scatter(projected_output)
             output[...] = projected_output
@@ -1700,7 +1759,9 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
 
         return output
 
-    def _forward_o_proj(self, o_proj_input, full_gather_wo_a_enabled=False):
+    def _forward_o_proj(
+        self, o_proj_input: torch.Tensor, output: torch.Tensor | None = None, *, full_gather_wo_a_enabled: bool = False
+    ) -> torch.Tensor:
         """Project with the active weights; the caller owns their lifetime."""
         num_tokens = o_proj_input.shape[0]
         o_proj_groups = self.n_group if full_gather_wo_a_enabled else self.n_local_groups
@@ -1739,7 +1800,11 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
                 batch_split_factor=1,
             )
             o_proj_input = o_proj_input.reshape(num_tokens, -1)
-        return self._apply_wo_b(o_proj_input, full_gather_wo_a_enabled)
+        projected_output = self._apply_wo_b(o_proj_input, full_gather_wo_a_enabled)
+        if output is None:
+            return projected_output
+        output[...] = projected_output
+        return output
 
     def _forward(
         self,
@@ -2403,12 +2468,16 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
             global_common_attn_metadata,
             pcp_context.global_batch.num_reqs,
         )
+        # num_prefills can miss short prefills; prevent local PCP RoPE from
+        # overwriting the global RoPE buffer whenever a request is prefilling.
+        can_use_rope_cache = not bool(pcp_context.global_batch.is_prefilling_np.any())
         global_dsa_metadata = self._global_metadata_builder.build(
             common_prefix_len,
             global_common_attn_metadata,
             fast_build,
             num_actual_reqs=pcp_context.global_batch.num_reqs,
             common_ratio_to_sas_metadata={},
+            can_use_rope_cache=can_use_rope_cache,
         )
         local_common_attn_metadata = self._build_local_common_attn_metadata(
             pcp_context,

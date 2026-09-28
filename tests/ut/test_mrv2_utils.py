@@ -16,447 +16,238 @@
 #
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 import vllm_ascend.mrv2_utils as mrv2_utils
-from vllm_ascend.mrv2_utils import (
-    _v2_model_runner_environment_ready,
-    is_default_v2_model_runner_model,
-    is_supported_v2_model_runner_feature,
-    use_v2_model_runner,
+from vllm_ascend.mrv2_utils import use_v2_model_runner
+
+
+@pytest.mark.parametrize("env_value", [True, False])
+def test_environment_override_wins(monkeypatch, env_value):
+    monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", env_value)
+
+    assert use_v2_model_runner(SimpleNamespace()) is env_value
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        SimpleNamespace(),
+        SimpleNamespace(model_config=None),
+        SimpleNamespace(
+            model_config=SimpleNamespace(
+                runner_type="generate",
+                is_attention_free=True,
+                architecture="UnknownModel",
+                architectures=["UnknownModel"],
+            )
+        ),
+        SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="unknown_method",
+                num_speculative_tokens_per_batch_size=[[1, 256, 4]],
+            )
+        ),
+        SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="dflash",
+                enforce_eager=True,
+                draft_model_config=SimpleNamespace(architectures=["DFlash2DraftModel"]),
+            )
+        ),
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(kv_connector="MooncakeConnectorV2"),
+        ),
+        SimpleNamespace(additional_config={"enable_kvpp": True}),
+        SimpleNamespace(additional_config={"enable_reduce_sample": False}),
+        SimpleNamespace(additional_config={"enable_reduce_sample": "false"}),
+        SimpleNamespace(additional_config={"eplb_config": {"dynamic_eplb": True}}),
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(kv_connector="AscendStoreConnector")),
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(
+                kv_connector="AscendStoreConnector",
+                kv_connector_extra_config={"backend": "memcache"},
+            )
+        ),
+    ],
+    ids=[
+        "empty-config",
+        "no-model",
+        "unknown-attention-free-generate",
+        "dynamic-unsupported-speculation",
+        "dflash2-eager",
+        "mooncake-pd",
+        "kvpp",
+        "reduce-sample-disabled",
+        "reduce-sample-string-false",
+        "dynamic-eplb",
+        "kv-pool-connector",
+        "kv-pool-memcache",
+    ],
 )
+def test_v2_is_default_outside_the_blacklist(monkeypatch, config):
+    monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", None)
+    monkeypatch.setattr(mrv2_utils, "is_310p", lambda: False)
 
-DEFAULT_V2_ARCH = "Qwen3ForCausalLM"
-
-
-def _make_model_config(**kwargs) -> SimpleNamespace:
-    attrs = {
-        "runner_type": "generate",
-        "is_hybrid": False,
-        "is_attention_free": False,
-        "architectures": ["SomeModelForCausalLM"],
-    }
-    attrs.update(kwargs)
-    return SimpleNamespace(**attrs)
+    assert use_v2_model_runner(config) is True
 
 
-def _make_vllm_config(
-    model_config=None,
-    speculative_config=None,
-    lora_config=None,
-    additional_config=None,
-) -> SimpleNamespace:
-    return SimpleNamespace(
-        model_config=model_config,
-        speculative_config=speculative_config,
-        lora_config=lora_config,
-        additional_config=additional_config,
+@pytest.mark.parametrize(
+    "config",
+    [
+        SimpleNamespace(lora_config=object()),
+        SimpleNamespace(model_config=SimpleNamespace(architectures=["HYV3ForCausalLM"])),
+        SimpleNamespace(model_config=SimpleNamespace(architecture="HYV3ForCausalLM")),
+        SimpleNamespace(model_config=SimpleNamespace(architectures=["Gemma4ForCausalLM"])),
+        SimpleNamespace(model_config=SimpleNamespace(architectures=["Gemma4ForConditionalGeneration"])),
+        SimpleNamespace(model_config=SimpleNamespace(architectures=["Gemma4UnifiedForConditionalGeneration"])),
+        SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=["Gemma4ForCausalLM"])),
+        ),
+        SimpleNamespace(model_config=SimpleNamespace(runner_type="pooling")),
+        SimpleNamespace(model_config=SimpleNamespace(is_pooling_model=True)),
+        SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=True)),
+        SimpleNamespace(ec_transfer_config=object()),
+        SimpleNamespace(
+            model_config=SimpleNamespace(multimodal_config=SimpleNamespace(mm_encoder_only=True)),
+        ),
+        SimpleNamespace(compilation_config=SimpleNamespace(cudagraph_mm_encoder=True)),
+        SimpleNamespace(additional_config={"draft_window_size": 512}),
+        SimpleNamespace(additional_config={"enable_reduce_sample": True}),
+        SimpleNamespace(additional_config={"enable_reduce_sample": "true"}),
+        SimpleNamespace(additional_config={"enable_reduce_sample": 1}),
+        SimpleNamespace(speculative_config=SimpleNamespace(method="suffix")),
+        SimpleNamespace(speculative_config=SimpleNamespace(method="ngram")),
+        SimpleNamespace(speculative_config=SimpleNamespace(method="ngram_gpu")),
+        SimpleNamespace(speculative_config=SimpleNamespace(parallel_drafting=True)),
+        SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="dflash",
+                enforce_eager=False,
+                draft_model_config=SimpleNamespace(architectures=["DFlash2DraftModel"]),
+            )
+        ),
+    ],
+    ids=[
+        "lora",
+        "hy3-preview",
+        "hy3-preview-architecture",
+        "gemma4-causal",
+        "gemma4-conditional",
+        "gemma4-unified",
+        "gemma4-hf-config",
+        "pooling-runner",
+        "pooling-model",
+        "encoder-decoder",
+        "vl-encoder-disaggregation",
+        "vl-encoder-only",
+        "vl-encoder-graph",
+        "draft-window-size",
+        "enable-reduce-sample",
+        "enable-reduce-sample-string",
+        "enable-reduce-sample-int",
+        "suffix-speculative-decoding",
+        "ngram-speculative-decoding",
+        "ngram-gpu-speculative-decoding",
+        "parallel-drafting",
+        "dflash2-graph",
+    ],
+)
+def test_blacklisted_features_default_to_v1(monkeypatch, config):
+    monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", None)
+    monkeypatch.setattr(mrv2_utils, "is_310p", lambda: False)
+
+    assert use_v2_model_runner(config) is False
+
+
+def test_310p_defaults_to_v1(monkeypatch):
+    monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", None)
+    monkeypatch.setattr(mrv2_utils, "is_310p", lambda: True)
+
+    assert use_v2_model_runner(SimpleNamespace()) is False
+
+
+def test_310p_env_override_still_wins(monkeypatch):
+    monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", True)
+    monkeypatch.setattr(mrv2_utils, "is_310p", lambda: True)
+
+    assert use_v2_model_runner(SimpleNamespace()) is True
+
+
+def test_magicmock_config_does_not_trip_the_blacklist(monkeypatch):
+    monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", None)
+    monkeypatch.setattr(mrv2_utils, "is_310p", lambda: False)
+
+    assert use_v2_model_runner(MagicMock()) is True
+
+
+def test_blacklist_does_not_override_explicit_env(monkeypatch):
+    monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", True)
+
+    assert use_v2_model_runner(SimpleNamespace(lora_config=object())) is True
+    assert use_v2_model_runner(SimpleNamespace(model_config=SimpleNamespace(architectures=["HYV3ForCausalLM"]))) is True
+    assert (
+        use_v2_model_runner(SimpleNamespace(model_config=SimpleNamespace(architectures=["Gemma4ForCausalLM"]))) is True
+    )
+    assert use_v2_model_runner(SimpleNamespace(model_config=SimpleNamespace(runner_type="pooling"))) is True
+    assert use_v2_model_runner(SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=True))) is True
+    assert use_v2_model_runner(SimpleNamespace(additional_config={"enable_kvpp": True})) is True
+    assert use_v2_model_runner(SimpleNamespace(ec_transfer_config=object())) is True
+    assert use_v2_model_runner(SimpleNamespace(compilation_config=SimpleNamespace(cudagraph_mm_encoder=True))) is True
+    assert use_v2_model_runner(SimpleNamespace(additional_config={"draft_window_size": 512})) is True
+    assert use_v2_model_runner(SimpleNamespace(additional_config={"enable_reduce_sample": True})) is True
+    assert (
+        use_v2_model_runner(SimpleNamespace(kv_transfer_config=SimpleNamespace(kv_connector="AscendStoreConnector")))
+        is True
     )
 
 
-def _make_speculative_config(method: str, num_speculative_tokens_per_batch_size=None):
-    return SimpleNamespace(
-        method=method,
-        num_speculative_tokens_per_batch_size=num_speculative_tokens_per_batch_size,
-    )
+def test_default_v2_logs_selection(monkeypatch):
+    info_calls = []
+    monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", None)
+    monkeypatch.setattr(mrv2_utils, "is_310p", lambda: False)
+    monkeypatch.setattr(mrv2_utils.logger, "info_once", lambda *args: info_calls.append(args))
 
+    assert use_v2_model_runner(SimpleNamespace()) is True
+    assert len(info_calls) == 1
 
-class TestIsDefaultV2ModelRunnerModel:
-    @pytest.mark.parametrize(
-        "architecture",
-        [
-            "Qwen3ForCausalLM",
-            "Qwen3MoeForCausalLM",
-            "MiniMaxM2ForCausalLM",
-            "DeepseekV3ForCausalLM",
-            "DeepseekV32ForCausalLM",
-            "GlmMoeDsaForCausalLM",
-            "DeepseekV4ForCausalLM",
-            "Qwen3_5MoeForCausalLM",
-        ],
-    )
-    def test_whitelisted_architecture(self, architecture):
-        config = _make_vllm_config(model_config=_make_model_config(architectures=[architecture]))
 
-        assert is_default_v2_model_runner_model(config) is True
+def test_blacklist_logs_fallback(monkeypatch):
+    warning_calls = []
+    monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", None)
+    monkeypatch.setattr(mrv2_utils.logger, "warning_once", lambda *args, **kwargs: warning_calls.append(args))
 
-    def test_unknown_architecture(self):
-        config = _make_vllm_config(model_config=_make_model_config())
+    assert use_v2_model_runner(SimpleNamespace(lora_config=object())) is False
+    assert len(warning_calls) == 1
+    assert "LoRA" in warning_calls[0][1]
 
-        assert is_default_v2_model_runner_model(config) is False
 
-    def test_none_model_config(self):
-        assert is_default_v2_model_runner_model(_make_vllm_config(model_config=None)) is False
+def test_validation_is_decoupled_from_upstream():
+    mrv2_utils._validate_v2_model_runner(object())
+    mrv2_utils._validate_v2_model_runner(SimpleNamespace())
 
-    def test_non_generate_runner_type(self):
-        config = _make_vllm_config(
-            model_config=_make_model_config(runner_type="embedding", architectures=[DEFAULT_V2_ARCH])
-        )
 
-        assert is_default_v2_model_runner_model(config) is False
+def test_apply_config_patch_is_wired(monkeypatch):
+    from vllm.config.vllm import VllmConfig
 
-    def test_draft_runner_type_inherits_v2(self):
-        # Draft ModelConfig uses runner_type="draft" and a draft architecture
-        # (e.g. DeepSeekV4MTPModel) that is not on the generate whitelist.
-        # The target already passed the whitelist; re-checking the draft
-        # architecture would drop the V2 speculator back to V1.
-        config = _make_vllm_config(
-            model_config=_make_model_config(
-                runner_type="draft",
-                architectures=["DeepSeekV4MTPModel"],
-            )
-        )
+    original_property = VllmConfig.use_v2_model_runner
+    original_validate = VllmConfig._validate_v2_model_runner
 
-        assert is_default_v2_model_runner_model(config) is True
+    monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", False)
 
-    @pytest.mark.parametrize(
-        "architecture",
-        [
-            "Qwen3ForCausalLM",
-            "Qwen3MoeForCausalLM",
-            "MiniMaxM2ForCausalLM",
-            "DeepseekV3ForCausalLM",
-            "DeepseekV32ForCausalLM",
-            "GlmMoeDsaForCausalLM",
-            "DeepseekV4ForCausalLM",
-            "Qwen3_5MoeForCausalLM",
-        ],
-    )
-    def test_hybrid_does_not_block_whitelisted_architecture(self, architecture):
-        config = _make_vllm_config(model_config=_make_model_config(is_hybrid=True, architectures=[architecture]))
+    mrv2_utils.apply_v2_model_runner_config_patch()
+    assert isinstance(VllmConfig.use_v2_model_runner, property)
+    assert VllmConfig.use_v2_model_runner.fget is mrv2_utils.use_v2_model_runner
 
-        assert is_default_v2_model_runner_model(config) is True
+    # Upstream GPU-specific validation must not change Ascend's default.
+    VllmConfig._validate_v2_model_runner(object())
 
-    def test_hybrid_non_whitelisted_architecture_is_still_excluded(self):
-        config = _make_vllm_config(
-            model_config=_make_model_config(is_hybrid=True, architectures=["SomeModelForCausalLM"])
-        )
+    # Re-applying is harmless.
+    mrv2_utils.apply_v2_model_runner_config_patch()
+    VllmConfig._validate_v2_model_runner(object())
 
-        assert is_default_v2_model_runner_model(config) is False
-
-    def test_qwen3_5_conditional_generation_is_not_whitelisted(self):
-        config = _make_vllm_config(
-            model_config=_make_model_config(
-                is_hybrid=True,
-                architectures=["Qwen3_5ForConditionalGeneration"],
-            )
-        )
-
-        assert is_default_v2_model_runner_model(config) is False
-
-    def test_attention_free_model(self):
-        config = _make_vllm_config(
-            model_config=_make_model_config(is_attention_free=True, architectures=[DEFAULT_V2_ARCH])
-        )
-
-        assert is_default_v2_model_runner_model(config) is False
-
-
-class TestIsSupportedV2ModelRunnerFeature:
-    def test_without_speculative_config(self):
-        config = _make_vllm_config(speculative_config=None)
-
-        assert is_supported_v2_model_runner_feature(config) is True
-
-    @pytest.mark.parametrize("method", ["eagle3", "mtp", "dflash", "dspark"])
-    def test_whitelisted_methods(self, monkeypatch, method):
-        monkeypatch.setattr(mrv2_utils.logger, "info_once", lambda *args: None)
-        config = _make_vllm_config(speculative_config=_make_speculative_config(method))
-
-        assert is_supported_v2_model_runner_feature(config) is True
-
-    @pytest.mark.parametrize("method", ["ngram", "ngram_gpu", "eagle", "unknown_method"])
-    def test_unsupported_method(self, method):
-        config = _make_vllm_config(speculative_config=_make_speculative_config(method))
-
-        assert is_supported_v2_model_runner_feature(config) is False
-
-    def test_whitelisted_method_logs_info(self, monkeypatch):
-        info_calls = []
-        monkeypatch.setattr(mrv2_utils.logger, "info_once", lambda *args: info_calls.append(args))
-        config = _make_vllm_config(speculative_config=_make_speculative_config("eagle3"))
-
-        assert is_supported_v2_model_runner_feature(config) is True
-        assert len(info_calls) == 1
-
-    def test_lora_is_excluded(self, monkeypatch):
-        warning_calls = []
-        monkeypatch.setattr(mrv2_utils.logger, "warning_once", lambda *args: warning_calls.append(args))
-        config = _make_vllm_config(lora_config=object())
-
-        assert is_supported_v2_model_runner_feature(config) is False
-        assert len(warning_calls) == 1
-
-    def test_lora_is_excluded_even_with_whitelisted_spec(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils.logger, "warning_once", lambda *args: None)
-        config = _make_vllm_config(
-            speculative_config=_make_speculative_config("eagle3"),
-            lora_config=object(),
-        )
-
-        assert is_supported_v2_model_runner_feature(config) is False
-
-    @pytest.mark.parametrize("method", ["eagle3", "mtp", "dflash", "dspark"])
-    def test_dynamic_speculative_decoding_is_excluded(self, monkeypatch, method):
-        warning_calls = []
-        monkeypatch.setattr(mrv2_utils.logger, "warning_once", lambda *args: warning_calls.append(args))
-        config = _make_vllm_config(
-            speculative_config=_make_speculative_config(
-                method,
-                num_speculative_tokens_per_batch_size=[[1, 256, 4]],
-            )
-        )
-
-        assert is_supported_v2_model_runner_feature(config) is False
-        assert len(warning_calls) == 1
-
-    def test_dspark_sliding_window_is_excluded(self, monkeypatch):
-        warning_calls = []
-        monkeypatch.setattr(mrv2_utils.logger, "warning_once", lambda *args: warning_calls.append(args))
-        config = _make_vllm_config(
-            speculative_config=_make_speculative_config("dspark"),
-            additional_config={"draft_window_size": 512},
-        )
-
-        assert is_supported_v2_model_runner_feature(config) is False
-        assert len(warning_calls) == 1
-
-    def test_dspark_without_sliding_window_is_supported(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils.logger, "info_once", lambda *args: None)
-        config = _make_vllm_config(speculative_config=_make_speculative_config("dspark"))
-
-        assert is_supported_v2_model_runner_feature(config) is True
-
-    def test_eagle3_sliding_window_is_not_dspark_blacklist(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils.logger, "info_once", lambda *args: None)
-        config = _make_vllm_config(
-            speculative_config=_make_speculative_config("eagle3"),
-            additional_config={"draft_window_size": 512},
-        )
-
-        assert is_supported_v2_model_runner_feature(config) is True
-
-
-class TestV2ModelRunnerEnvironmentReady:
-    def test_unsupported_feature(self):
-        config = _make_vllm_config(speculative_config=_make_speculative_config("ngram"))
-
-        assert _v2_model_runner_environment_ready(config) is False
-
-    def test_lora_is_not_ready(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils.logger, "warning_once", lambda *args: None)
-        config = _make_vllm_config(lora_config=object())
-
-        assert _v2_model_runner_environment_ready(config) is False
-
-    def test_dynamic_speculative_decoding_is_not_ready(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils.logger, "warning_once", lambda *args: None)
-        config = _make_vllm_config(
-            speculative_config=_make_speculative_config(
-                "dflash",
-                num_speculative_tokens_per_batch_size=[[1, 256, 4]],
-            )
-        )
-
-        assert _v2_model_runner_environment_ready(config) is False
-
-    def test_dspark_sliding_window_is_not_ready(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils.logger, "warning_once", lambda *args: None)
-        config = _make_vllm_config(
-            speculative_config=_make_speculative_config("dspark"),
-            additional_config={"draft_window_size": 512},
-        )
-
-        assert _v2_model_runner_environment_ready(config) is False
-
-    def test_without_triton_on_non_310p(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils, "is_310p", lambda: False)
-        monkeypatch.setattr("vllm.triton_utils.HAS_TRITON", False)
-        warning_calls = []
-        monkeypatch.setattr(mrv2_utils.logger, "warning_once", lambda *args: warning_calls.append(args))
-        config = _make_vllm_config(speculative_config=None)
-
-        assert _v2_model_runner_environment_ready(config) is False
-        assert len(warning_calls) == 1
-
-    def test_with_triton_on_non_310p(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils, "is_310p", lambda: False)
-        monkeypatch.setattr("vllm.triton_utils.HAS_TRITON", True)
-        config = _make_vllm_config(speculative_config=None)
-
-        assert _v2_model_runner_environment_ready(config) is True
-
-    @pytest.mark.parametrize("has_triton", [True, False])
-    def test_310p_excluded_regardless_of_triton(self, monkeypatch, has_triton):
-        # 310P does not support the V2 model runner.
-        monkeypatch.setattr(mrv2_utils, "is_310p", lambda: True)
-        monkeypatch.setattr("vllm.triton_utils.HAS_TRITON", has_triton)
-        config = _make_vllm_config(speculative_config=None)
-
-        assert _v2_model_runner_environment_ready(config) is False
-
-
-class TestUseV2ModelRunner:
-    @pytest.mark.parametrize("env_value", [True, False])
-    def test_env_override_wins(self, monkeypatch, env_value):
-        monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", env_value)
-        config = _make_vllm_config(model_config=_make_model_config())
-
-        assert use_v2_model_runner(config) is env_value
-
-    def test_default_enabled_for_whitelisted_model(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", None)
-        monkeypatch.setattr(mrv2_utils, "_v2_model_runner_environment_ready", lambda _config: True)
-        config = _make_vllm_config(model_config=_make_model_config(architectures=[DEFAULT_V2_ARCH]))
-
-        assert use_v2_model_runner(config) is True
-
-    def test_default_disabled_when_environment_not_ready(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", None)
-        monkeypatch.setattr(mrv2_utils, "_v2_model_runner_environment_ready", lambda _config: False)
-        config = _make_vllm_config(model_config=_make_model_config(architectures=[DEFAULT_V2_ARCH]))
-
-        assert use_v2_model_runner(config) is False
-
-    def test_non_whitelisted_model_falls_back(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", None)
-        warning_calls = []
-        monkeypatch.setattr(mrv2_utils.logger, "warning_once", lambda *args: warning_calls.append(args))
-        config = _make_vllm_config(model_config=_make_model_config())
-
-        assert use_v2_model_runner(config) is False
-        assert len(warning_calls) == 1
-
-    def test_none_model_config_falls_back(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", None)
-        warning_calls = []
-        monkeypatch.setattr(mrv2_utils.logger, "warning_once", lambda *args: warning_calls.append(args))
-        config = _make_vllm_config(model_config=None)
-
-        assert use_v2_model_runner(config) is False
-        assert len(warning_calls) == 1
-
-    def test_default_disabled_for_lora(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", None)
-        monkeypatch.setattr(mrv2_utils, "is_310p", lambda: False)
-        monkeypatch.setattr("vllm.triton_utils.HAS_TRITON", True)
-        monkeypatch.setattr(mrv2_utils.logger, "warning_once", lambda *args: None)
-        config = _make_vllm_config(
-            model_config=_make_model_config(architectures=[DEFAULT_V2_ARCH]),
-            lora_config=object(),
-        )
-
-        assert use_v2_model_runner(config) is False
-
-    def test_default_enabled_for_hybrid_whitelisted_model(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", None)
-        monkeypatch.setattr(mrv2_utils, "is_310p", lambda: False)
-        monkeypatch.setattr("vllm.triton_utils.HAS_TRITON", True)
-        monkeypatch.setattr(mrv2_utils.logger, "info_once", lambda *args: None)
-        config = _make_vllm_config(
-            model_config=_make_model_config(
-                is_hybrid=True,
-                architectures=[DEFAULT_V2_ARCH],
-            )
-        )
-
-        assert use_v2_model_runner(config) is True
-
-    def test_default_disabled_for_qwen3_5_conditional_generation(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", None)
-        monkeypatch.setattr(mrv2_utils.logger, "warning_once", lambda *args: None)
-        config = _make_vllm_config(
-            model_config=_make_model_config(
-                is_hybrid=True,
-                architectures=["Qwen3_5ForConditionalGeneration"],
-            )
-        )
-
-        assert use_v2_model_runner(config) is False
-
-    def test_default_disabled_for_dynamic_speculative_decoding(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", None)
-        monkeypatch.setattr(mrv2_utils, "is_310p", lambda: False)
-        monkeypatch.setattr("vllm.triton_utils.HAS_TRITON", True)
-        monkeypatch.setattr(mrv2_utils.logger, "warning_once", lambda *args: None)
-        monkeypatch.setattr(mrv2_utils.logger, "info_once", lambda *args: None)
-        config = _make_vllm_config(
-            model_config=_make_model_config(architectures=[DEFAULT_V2_ARCH]),
-            speculative_config=_make_speculative_config(
-                "dflash",
-                num_speculative_tokens_per_batch_size=[[1, 256, 4]],
-            ),
-        )
-
-        assert use_v2_model_runner(config) is False
-
-    def test_default_disabled_for_dspark_sliding_window(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", None)
-        monkeypatch.setattr(mrv2_utils, "is_310p", lambda: False)
-        monkeypatch.setattr("vllm.triton_utils.HAS_TRITON", True)
-        monkeypatch.setattr(mrv2_utils.logger, "warning_once", lambda *args: None)
-        monkeypatch.setattr(mrv2_utils.logger, "info_once", lambda *args: None)
-        config = _make_vllm_config(
-            model_config=_make_model_config(architectures=[DEFAULT_V2_ARCH]),
-            speculative_config=_make_speculative_config("dspark"),
-            additional_config={"draft_window_size": 512},
-        )
-
-        assert use_v2_model_runner(config) is False
-
-    def test_default_enabled_for_deepseek_v4_mtp_draft(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", None)
-        monkeypatch.setattr(mrv2_utils, "is_310p", lambda: False)
-        monkeypatch.setattr("vllm.triton_utils.HAS_TRITON", True)
-        monkeypatch.setattr(mrv2_utils.logger, "info_once", lambda *args: None)
-        config = _make_vllm_config(
-            model_config=_make_model_config(
-                runner_type="draft",
-                architectures=["DeepSeekV4MTPModel"],
-            ),
-            speculative_config=_make_speculative_config("mtp"),
-        )
-
-        assert use_v2_model_runner(config) is True
-
-    def test_env_override_wins_with_lora(self, monkeypatch):
-        monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", True)
-        config = _make_vllm_config(
-            model_config=_make_model_config(architectures=[DEFAULT_V2_ARCH]),
-            lora_config=object(),
-        )
-
-        assert use_v2_model_runner(config) is True
-
-
-class TestV2ModelRunnerValidationPatch:
-    def test_validation_is_decoupled_from_upstream(self):
-        # The Ascend V2 runner decision is fully owned by use_v2_model_runner,
-        # so the replacement validation must never raise (e.g. the upstream
-        # Triton / feature-support checks do not apply).
-        mrv2_utils._validate_v2_model_runner(object())
-        mrv2_utils._validate_v2_model_runner(SimpleNamespace())
-
-    def test_apply_config_patch_is_wired(self, monkeypatch):
-        from vllm.config.vllm import VllmConfig
-
-        original_property = VllmConfig.use_v2_model_runner
-        original_validate = VllmConfig._validate_v2_model_runner
-
-        monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", False)
-
-        mrv2_utils.apply_v2_model_runner_config_patch()
-        assert isinstance(VllmConfig.use_v2_model_runner, property)
-        assert VllmConfig.use_v2_model_runner.fget is mrv2_utils.use_v2_model_runner
-
-        # The upstream Triton check must no longer run.
-        VllmConfig._validate_v2_model_runner(object())
-
-        # Re-applying is harmless.
-        mrv2_utils.apply_v2_model_runner_config_patch()
-        VllmConfig._validate_v2_model_runner(object())
-
-        # Restore the upstream class state so later tests are unaffected.
-        monkeypatch.setattr(VllmConfig, "use_v2_model_runner", original_property)
-        monkeypatch.setattr(VllmConfig, "_validate_v2_model_runner", original_validate)
+    # Restore the upstream class state so later tests are unaffected.
+    monkeypatch.setattr(VllmConfig, "use_v2_model_runner", original_property)
+    monkeypatch.setattr(VllmConfig, "_validate_v2_model_runner", original_validate)

@@ -57,7 +57,7 @@ class TestAscendDSACPOProjWeightSwitch(unittest.TestCase):
         impl._o_proj_weight_switch_enabled = False
         return impl
 
-    def test_enablement_is_not_gated_by_hardware_family(self):
+    def test_enablement_is_limited_to_a5(self):
         profile = MagicMock()
         profile.supports.return_value = False
         tp_group = SimpleNamespace(world_size=2, rank_in_group=0)
@@ -75,6 +75,10 @@ class TestAscendDSACPOProjWeightSwitch(unittest.TestCase):
                 "vllm_ascend.attention.context_parallel.dsa_cp.enable_dsa_cp_full_o_proj",
                 return_value=True,
             ),
+            patch(
+                "vllm_ascend.attention.context_parallel.dsa_cp.is_950",
+                side_effect=(False, True),
+            ),
             patch("vllm_ascend.attention.context_parallel.dsa_cp.get_tp_group", return_value=tp_group),
             patch(
                 "vllm_ascend.attention.context_parallel.dsa_cp.get_current_hardware_profile",
@@ -85,37 +89,42 @@ class TestAscendDSACPOProjWeightSwitch(unittest.TestCase):
                 return_value=SimpleNamespace(),
             ),
         ):
-            impl = AscendDSACPImpl(
-                n_heads=2,
-                scale=1.0,
-                n_local_heads=1,
-                q_lora_rank=1,
-                o_lora_rank=1,
-                head_dim=2,
-                rope_head_dim=1,
-                nope_head_dim=1,
-                n_groups=2,
-                n_local_groups=1,
-                window_size=1,
-                compress_ratio=1,
-                wq_a=layer,
-                wq_b=layer,
-                wkv=layer,
-                q_norm=object(),
-                kv_norm=object(),
-                swa_cache_layer=SimpleNamespace(prefix="swa"),
-                wo_a=layer,
-                wo_b=layer,
-                eps=1e-6,
-                attn_sink=torch.empty(2),
-            )
+            impls = [
+                AscendDSACPImpl(
+                    n_heads=2,
+                    scale=1.0,
+                    n_local_heads=1,
+                    q_lora_rank=1,
+                    o_lora_rank=1,
+                    head_dim=2,
+                    rope_head_dim=1,
+                    nope_head_dim=1,
+                    n_groups=2,
+                    n_local_groups=1,
+                    window_size=1,
+                    compress_ratio=1,
+                    wq_a=layer,
+                    wq_b=layer,
+                    wkv=layer,
+                    q_norm=object(),
+                    kv_norm=object(),
+                    swa_cache_layer=SimpleNamespace(prefix="swa"),
+                    wo_a=layer,
+                    wo_b=layer,
+                    eps=1e-6,
+                    attn_sink=torch.empty(2),
+                )
+                for _ in range(2)
+            ]
 
-        self.assertTrue(impl.multistream_dsv4_dsa_overlap)
-        self.assertIs(impl.cv_wq_a.linear, layer)
-        self.assertIs(impl.cv_wkv.linear, layer)
-        self.assertIs(impl.cv_wq_b.linear, layer)
-        self.assertTrue(impl.enable_dsa_cp_full_o_proj)
-        profile.supports.assert_called_once_with(HardwareCapability.FP8_ATTENTION)
+        self.assertFalse(impls[0].enable_dsa_cp_full_o_proj)
+        self.assertTrue(impls[1].enable_dsa_cp_full_o_proj)
+        for impl in impls:
+            self.assertTrue(impl.multistream_dsv4_dsa_overlap)
+            self.assertIs(impl.cv_wq_a.linear, layer)
+            self.assertIs(impl.cv_wkv.linear, layer)
+            self.assertIs(impl.cv_wq_b.linear, layer)
+        self.assertEqual(profile.supports.call_args_list, [unittest.mock.call(HardwareCapability.FP8_ATTENTION)] * 2)
 
     def test_get_weight_switch_method_unwraps_adapter_and_rejects_unsupported(self):
         layer = self._OProj()
