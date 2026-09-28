@@ -44,6 +44,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Valid: 0/1. No tensor contents or credentials; emits local device addresses.
     # Debug only: per-step host logging affects performance; disable for benchmarks.
     "VLLM_ASCEND_FLASH_MLA_TRACE": lambda: _strict_binary_env("VLLM_ASCEND_FLASH_MLA_TRACE"),
+    # Default 0; strict 0/1. Add bounded eager attention/KV references to SAMPLE_DIAG.
+    # Requires SAMPLE_DIAG_DIR and the same selected ranks. Not a credential;
+    # captured request/tensor data is private. Deliberately synchronizes the hot path.
+    "VLLM_ASCEND_FLASH_MLA_CHUNK_DIAG": lambda: _strict_binary_env("VLLM_ASCEND_FLASH_MLA_CHUNK_DIAG"),
+    # Default {}. JSON: max_layers=2 (1..8), requests_per_phase=2 (1..8),
+    # query_rows=2 (1..4), max_kv_tokens=4096 (1..16384), max_saved_mib=128 (1..1024),
+    # layer_names=[] (<=8), request_ids=[] (<=16), atol/rtol=0.05 (finite 0..1).
+    # start_after_forwards=0 (0..1000000), scan_all_mla_layers=false (JSON boolean).
+    # Only matching forwards after the delay consume the attention/sampling budget.
+    # Names/IDs are optional exact-match filters, not credentials. Diagnostic only.
+    "VLLM_ASCEND_FLASH_MLA_CHUNK_DIAG_CONFIG": lambda: os.getenv("VLLM_ASCEND_FLASH_MLA_CHUNK_DIAG_CONFIG", "{}"),
     # Eager-only numerical sampling diagnostics. Default empty disables all hooks.
     # Nonempty path enables private per-rank reports; artifacts contain request
     # IDs/token IDs/logits (sensitive run data), never credentials. Debug copies

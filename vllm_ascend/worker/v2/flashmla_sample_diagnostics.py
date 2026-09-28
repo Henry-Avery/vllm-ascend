@@ -23,6 +23,7 @@ import torch
 
 MAX_BATCH_ROWS = 128
 MAX_VOCAB_SIZE = 262144
+MAX_HIDDEN_SIZE = 32768
 TOP_K = 5
 
 
@@ -106,6 +107,7 @@ class SampleDiagnostics:
         self.step = 0
         self.active = False
         self.exhausted = False
+        self.forward_id = None
         self.directory = Path(config.directory) / (
             f"{self.identity['host']}-pid{os.getpid()}-g{global_rank}-dp{dp_rank}-tp{tp_rank}-{uuid4().hex[:8]}"
         )
@@ -118,11 +120,17 @@ class SampleDiagnostics:
             watched_token_text="unverified; token 0 is not assumed to be !",
             diagnostic_synchronization=True,
             scope="eager, no speculation, unsharded sampler only",
+            hidden_boundaries=True,
         )
 
     def _emit(self, event, **fields):
         record = dict(
-            event=event, step=self.step, utc=datetime.now(timezone.utc).isoformat(), **self.identity, **fields
+            event=event,
+            step=self.step,
+            forward_id=self.forward_id,
+            utc=datetime.now(timezone.utc).isoformat(),
+            **self.identity,
+            **fields,
         )
         descriptor = os.open(self.directory / "events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(descriptor, "a", encoding="utf-8") as output:
@@ -165,7 +173,10 @@ class SampleDiagnostics:
         ):
             raise RuntimeError("Sampling diagnostics require exactly one logits row per request")
 
-    def run(self, runner, batch, original_call):
+    def run(self, runner, batch, original_call, hidden_states=None):
+        self.forward_id = getattr(batch, "flashmla_diagnostic_id", None)
+        if getattr(batch, "flashmla_diagnostic_selected", True) is False:
+            return original_call()
         if self.step >= self.config.steps:
             if not self.exhausted:
                 self._emit(
@@ -178,6 +189,7 @@ class SampleDiagnostics:
         self.step += 1
         self.active = True
         snapshots = {}
+        hidden_snapshots = {}
         original_logits = runner.model.compute_logits
         original_sample = runner.sampler.sample if runner.sampler is not None else None
         absent = object()
@@ -193,8 +205,37 @@ class SampleDiagnostics:
                 raise RuntimeError("Sampling diagnostics vocabulary/token IDs exceed configured bounds")
             snapshots[stage] = value[: batch.num_reqs].detach().clone()
 
+        def copy_hidden(stage, value):
+            if (
+                not isinstance(value, torch.Tensor)
+                or value.ndim != 2
+                or value.shape[0] < batch.num_reqs
+                or not 0 < value.shape[1] <= MAX_HIDDEN_SIZE
+            ):
+                self._emit("boundary_skipped", stage=stage, reason="unmapped_hidden_rows_or_width")
+                return
+            if stage in hidden_snapshots:
+                raise RuntimeError(f"Sampling diagnostics observed repeated {stage} calls")
+            value = value[: batch.num_reqs].detach().cpu().clone()
+            hidden_snapshots[stage] = value
+            summaries = summarize_logits(value, ())
+            self._emit(
+                "hidden_boundary",
+                stage=stage,
+                rows=[dict(request_id=req, **summary) for req, summary in zip(batch.req_ids, summaries)],
+            )
+            if stage == "lm_head_input" and "model_output" in hidden_snapshots:
+                expected = hidden_snapshots["model_output"]
+                same = value.shape == expected.shape and bool(
+                    ((value == expected) | (torch.isnan(value) & torch.isnan(expected))).all()
+                )
+                self._emit("hidden_mapping", passed=same, request_ids=list(batch.req_ids))
+
         @wraps(original_logits)
         def observe_logits(*args, **kwargs):
+            bound = inspect.signature(original_logits).bind(*args, **kwargs)
+            value = next((arg for arg in bound.arguments.values() if isinstance(arg, torch.Tensor)), None)
+            copy_hidden("lm_head_input", value)
             value = original_logits(*args, **kwargs)
             # Before grammar masks or sampler in-place processing.
             copy_logits("raw", value)
@@ -222,12 +263,13 @@ class SampleDiagnostics:
                 request_ids=list(batch.req_ids),
                 diagnostic_synchronization=True,
             )
+            copy_hidden("model_output", hidden_states[batch.logits_indices] if hidden_states is not None else None)
             runner.model.compute_logits = observe_logits
             runner.sampler.sample = observe_sample
             result = original_call()
             if set(snapshots) != {"raw", "processed", "internal_sampled", "sampling_mapping"}:
                 raise RuntimeError("Sampling diagnostics did not observe the complete raw/processed sampler chain")
-            self._finish(runner, batch, result, snapshots)
+            self._finish(runner, batch, result, snapshots, hidden_snapshots)
             return result  # Preserve the original output objects and sampling decisions.
         except Exception as error:
             self._emit("error", error_type=type(error).__name__, message=str(error)[:512])
@@ -245,7 +287,7 @@ class SampleDiagnostics:
                         setattr(target, name, previous)
             self.active = False
 
-    def _finish(self, runner, batch, result, snapshots):
+    def _finish(self, runner, batch, result, snapshots, hidden_snapshots):
         output, num_sampled, _ = result
         sampled = output.sampled_token_ids.detach().cpu()
         counts = num_sampled.detach().cpu().reshape(-1)
@@ -299,10 +341,20 @@ class SampleDiagnostics:
             )
             for row, value in enumerate(selected):
                 rows[row][stage]["sampled_token_logit"] = _number(value)
+        hidden_invalid = [
+            any(not bool(torch.isfinite(value[row]).all()) for value in hidden_snapshots.values())
+            for row in range(len(rows))
+        ]
         priority = sorted(
             range(len(rows)),
             key=lambda row: (
-                not (_invalid_distribution(rows[row]["raw"]) or _invalid_distribution(rows[row]["processed"])),
+                bool(getattr(batch, "flashmla_diagnostic_request_ids", ()))
+                and rows[row]["request_id"] not in batch.flashmla_diagnostic_request_ids,
+                not (
+                    hidden_invalid[row]
+                    or _invalid_distribution(rows[row]["raw"])
+                    or _invalid_distribution(rows[row]["processed"])
+                ),
                 not (rows[row]["emitted"] and rows[row]["sampled_token_id"] in self.config.token_ids),
                 row,
             ),
@@ -318,6 +370,7 @@ class SampleDiagnostics:
                     "sampled_token_ids": sampled[priority],
                     "internal_sampled_token_ids": internal_sampled[priority],
                     "num_sampled": counts[priority],
+                    **{stage: values[priority] for stage, values in hidden_snapshots.items()},
                 },
                 output_file,
             )
@@ -362,12 +415,22 @@ def install_sample_diagnostics(runner, envs):
         global_rank=group.rank,
         capture_check=torch.npu.is_current_stream_capturing,
     )
+    if envs.VLLM_ASCEND_FLASH_MLA_CHUNK_DIAG:
+        # Lazy worker import preserves isolated CPU use of the sampling helper.
+        from vllm_ascend.attention.flashmla_chunk_diagnostics import ChunkDiagnosticConfig, ChunkDiagnostics
+
+        chunk_diagnostic = ChunkDiagnostics(
+            ChunkDiagnosticConfig.from_json(envs.VLLM_ASCEND_FLASH_MLA_CHUNK_DIAG_CONFIG), diagnostic
+        )
+        chunk_diagnostic.install(runner)
     original = runner.sample
 
     @wraps(original)
     def observed(hidden_states, input_batch, grammar_output):
         if type(runner.sampler) is not Sampler:
             raise RuntimeError("Sampling diagnostics require the pinned standard MRv2 Sampler, not a custom sampler")
-        return diagnostic.run(runner, input_batch, lambda: original(hidden_states, input_batch, grammar_output))
+        return diagnostic.run(
+            runner, input_batch, lambda: original(hidden_states, input_batch, grammar_output), hidden_states
+        )
 
     runner.sample = observed
