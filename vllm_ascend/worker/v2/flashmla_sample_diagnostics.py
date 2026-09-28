@@ -106,6 +106,7 @@ class SampleDiagnostics:
         self.step = 0
         self.active = False
         self.exhausted = False
+        self.forward_id = None
         self.directory = Path(config.directory) / (
             f"{self.identity['host']}-pid{os.getpid()}-g{global_rank}-dp{dp_rank}-tp{tp_rank}-{uuid4().hex[:8]}"
         )
@@ -122,7 +123,12 @@ class SampleDiagnostics:
 
     def _emit(self, event, **fields):
         record = dict(
-            event=event, step=self.step, utc=datetime.now(timezone.utc).isoformat(), **self.identity, **fields
+            event=event,
+            step=self.step,
+            forward_id=self.forward_id,
+            utc=datetime.now(timezone.utc).isoformat(),
+            **self.identity,
+            **fields,
         )
         descriptor = os.open(self.directory / "events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(descriptor, "a", encoding="utf-8") as output:
@@ -166,6 +172,7 @@ class SampleDiagnostics:
             raise RuntimeError("Sampling diagnostics require exactly one logits row per request")
 
     def run(self, runner, batch, original_call):
+        self.forward_id = getattr(batch, "flashmla_diagnostic_id", None)
         if self.step >= self.config.steps:
             if not self.exhausted:
                 self._emit(
@@ -362,6 +369,14 @@ def install_sample_diagnostics(runner, envs):
         global_rank=group.rank,
         capture_check=torch.npu.is_current_stream_capturing,
     )
+    if envs.VLLM_ASCEND_FLASH_MLA_CHUNK_DIAG:
+        # Lazy worker import preserves isolated CPU use of the sampling helper.
+        from vllm_ascend.attention.flashmla_chunk_diagnostics import ChunkDiagnosticConfig, ChunkDiagnostics
+
+        chunk_diagnostic = ChunkDiagnostics(
+            ChunkDiagnosticConfig.from_json(envs.VLLM_ASCEND_FLASH_MLA_CHUNK_DIAG_CONFIG), diagnostic
+        )
+        chunk_diagnostic.install(runner)
     original = runner.sample
 
     @wraps(original)

@@ -79,11 +79,7 @@ def get_single_raw_mla_backing(raw_cache: object) -> torch.Tensor | None:
     """
     if isinstance(raw_cache, torch.Tensor):
         return raw_cache
-    if (
-        isinstance(raw_cache, tuple)
-        and len(raw_cache) == 1
-        and isinstance(raw_cache[0], torch.Tensor)
-    ):
+    if isinstance(raw_cache, tuple) and len(raw_cache) == 1 and isinstance(raw_cache[0], torch.Tensor):
         return raw_cache[0]
     return None
 
@@ -95,9 +91,7 @@ def mla_spec_supports_single_raw_backing(spec: AscendMLAAttentionSpec) -> bool:
     the worker layer rather than on the public KV cache spec.
     """
     return (
-        get_kv_cache_compression_ratio(spec) == 1
-        and spec.model_version is None
-        and not spec.indexes_kv_by_block_stride
+        get_kv_cache_compression_ratio(spec) == 1 and spec.model_version is None and not spec.indexes_kv_by_block_stride
     )
 
 

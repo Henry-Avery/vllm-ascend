@@ -231,6 +231,8 @@ class AscendMLAMetadata:
     prefill: AscendMLAPrefillMetadata | None = None
     reshape_cache_event: torch.npu.Event = None
     external_flashmla: FlashMLADecode | None = None
+    # Opt-in eager observer, attached by the runner after metadata construction.
+    chunk_diagnostics: Any = None
 
     def __post_init__(self):
         pass
@@ -1356,6 +1358,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_metadata: AscendMLAMetadata,
         prefix_output: torch.Tensor,
         prefix_lse: torch.Tensor,
+        diagnostic=None,
     ):
         assert len(kv_c_and_k_pe_cache) > 1
         prefill_metadata = attn_metadata.prefill
@@ -1426,6 +1429,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             )
             if rope_dim == 0:
                 k_pe = kv_c_normed.new_empty(toks, num_heads, 0)
+            if diagnostic is not None:
+                diagnostic.gather(i, kv_c_normed, k_pe)
             kv_c_normed, k_pe = self._reorg_kvcache(
                 kv_c_normed,
                 k_pe,
@@ -1460,6 +1465,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             chunk_out, chunk_lse = torch_npu.npu_fused_infer_attention_score(
                 query, key.contiguous(), v.contiguous(), **common_kwargs
             )
+            if diagnostic is not None:
+                diagnostic.history(i, k_nope, k_pe, v, chunk_out, chunk_lse)
 
             if chunk_lse.dim() == 2:
                 chunk_lse = chunk_lse.transpose(0, 1).unsqueeze(-1)
@@ -1480,6 +1487,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         value: torch.Tensor,
         kv_c_and_k_pe_cache: tuple[torch.Tensor],
         attn_metadata: AscendMLAMetadata,
+        diagnostic=None,
     ) -> torch.Tensor:
         assert attn_metadata.prefill is not None
         assert len(kv_c_and_k_pe_cache) > 1
@@ -1531,10 +1539,21 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(
             query, key.contiguous(), value.contiguous(), **common_kwargs
         )
+        if diagnostic is not None:
+            diagnostic.current(q_nope, q_pe, k_nope, k_pe, value, attn_output, attn_lse)
 
         attn_output, attn_lse = self._compute_prefill_context(
-            q_nope, q_pe, kv_c_and_k_pe_cache, self.qk_rope_head_dim, attn_metadata, attn_output, attn_lse
+            q_nope,
+            q_pe,
+            kv_c_and_k_pe_cache,
+            self.qk_rope_head_dim,
+            attn_metadata,
+            attn_output,
+            attn_lse,
+            diagnostic=diagnostic,
         )
+        if diagnostic is not None:
+            diagnostic.merged(attn_output)
 
         attn_output = attn_output.reshape([num_tokens, self.num_heads * self.v_head_dim])
 
@@ -1998,7 +2017,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             decode_q_pe = decode_q_pe[:, : self.num_heads]
         return decode_q_nope, decode_q_pe
 
-    def _forward_external_flashmla(self, preprocessed, fused_cache, metadata):
+    def _forward_external_flashmla(self, preprocessed, fused_cache, metadata, diagnostic=None):
         flash = metadata.external_flashmla
         assert flash is not None
         if not isinstance(fused_cache, torch.Tensor):
@@ -2039,6 +2058,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             )
         # Zero unused query rows even if the package leaves their output undefined.
         latent.masked_fill_(~flash.token_live[None, :, None], 0)
+        if diagnostic is not None:
+            diagnostic.decode(flash, latent)
         if not self._logged_flashmla_decode:
             logger.info(
                 "[FlashMLA] decode_external: layer=%s layout=PA_BBND stride=%s offset=%s",
@@ -2150,7 +2171,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             return local_num_input_tokens - attn_metadata.num_decode_tokens
         return attn_metadata.num_actual_tokens - attn_metadata.num_decode_tokens
 
-    def mla_preprocess_prefill(self, q_c, kv_no_split, kv_cache, attn_metadata):
+    def mla_preprocess_prefill(self, q_c, kv_no_split, kv_cache, attn_metadata, diagnostic=None):
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_actual_prefill_tokens = num_actual_tokens - num_decode_tokens
@@ -2176,6 +2197,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             prefill_slots,
             attn_metadata=attn_metadata,
         )
+        if diagnostic is not None:
+            diagnostic.writer(prefill_k_c_normed, prefill_k_pe)
         prefill_k_nope, prefill_value = (
             self.kv_b_proj(prefill_k_c_normed)[0]
             .view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
@@ -2227,7 +2250,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             current_k_pe=current_k_pe,
         )
 
-    def _mla_preprocess(self, layer_name, hidden_states, kv_cache, attn_metadata):
+    def _mla_preprocess(self, layer_name, hidden_states, kv_cache, attn_metadata, diagnostic=None):
         # MLA Preprocess:
         # 1. Perform fused_qkv_a_proj and q_a_layernorm to obtain q_c and kv_no_split
         # or
@@ -2263,7 +2286,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             decode_preprocess_res = self.mla_preprocess_decode(q_c, kv_no_split, kv_cache, attn_metadata)
         # Preprocess for prefill tokens
         if has_prefill:
-            prefill_preprocess_res = self.mla_preprocess_prefill(q_c, kv_no_split, kv_cache, attn_metadata)
+            prefill_preprocess_res = self.mla_preprocess_prefill(
+                q_c, kv_no_split, kv_cache, attn_metadata, diagnostic=diagnostic
+            )
         # Let the connector record any sync primitive it needs once the paged KV
         # cache for this layer has been written. No-op for connectors that don't
         # implement on_kv_cache_written; the decision to actually transfer is made
@@ -2331,6 +2356,10 @@ class AscendMLAImpl(MLAAttentionImpl):
                 kv_cache[..., self.kv_lora_rank :],
             )
 
+        diagnostic = None
+        if getattr(attn_metadata, "chunk_diagnostics", None) is not None:
+            diagnostic = attn_metadata.chunk_diagnostics.begin_layer(self, layer_name, attn_metadata, kv_cache)
+
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
         o_proj_input_shape = (_EXTRA_CTX.num_tokens, self.num_heads * self.v_head_dim)
@@ -2361,13 +2390,13 @@ class AscendMLAImpl(MLAAttentionImpl):
             )
         else:
             decode_preprocess_res, prefill_preprocess_res = self._mla_preprocess(
-                layer_name, hidden_states, kv_cache, attn_metadata
+                layer_name, hidden_states, kv_cache, attn_metadata, diagnostic=diagnostic
             )
         if decode_preprocess_res is not None:
             # MLA Preprocess for decoding
             if attn_metadata.external_flashmla is not None:
                 output_decode = self._forward_external_flashmla(
-                    decode_preprocess_res, external_flash_cache, attn_metadata
+                    decode_preprocess_res, external_flash_cache, attn_metadata, diagnostic=diagnostic
                 )
             else:
                 output_decode = self._forward_decode(decode_preprocess_res, kv_cache[0].shape[1], attn_metadata)
@@ -2389,6 +2418,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 prefill_preprocess_res.value,
                 kv_cache,
                 attn_metadata,
+                diagnostic=diagnostic,
             )
             if self.external_flashmla_enabled and envs.VLLM_ASCEND_FLASH_MLA_TRACE:
                 logger.info(
@@ -2402,6 +2432,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             o_proj_input.mul_(torch.sigmoid(gate))
         # O proj
         output[...] = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
+        if diagnostic is not None:
+            diagnostic.finish(o_proj_input, output)
 
         del o_proj_input
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))

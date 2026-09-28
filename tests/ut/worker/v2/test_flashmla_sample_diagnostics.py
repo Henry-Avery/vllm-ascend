@@ -217,6 +217,7 @@ def test_installer_rank_and_eager_gates(api, tmp_path, monkeypatch, enforce_eage
     # Selecting TP0 leaves this TP1 worker entirely unmodified.
     envs = SimpleNamespace(
         VLLM_ASCEND_ENABLE_FLASH_MLA=True,
+        VLLM_ASCEND_FLASH_MLA_CHUNK_DIAG=False,
         VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_DIR=str(tmp_path),
         VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_STEPS=64,
         VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_ROWS=2,
@@ -252,6 +253,7 @@ def test_selected_rank_install_before_model_load_and_observe_first_sample(api, t
     monkeypatch.setattr(torch, "npu", SimpleNamespace(is_current_stream_capturing=lambda: False), raising=False)
     envs = SimpleNamespace(
         VLLM_ASCEND_ENABLE_FLASH_MLA=True,
+        VLLM_ASCEND_FLASH_MLA_CHUNK_DIAG=False,
         VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_DIR=str(tmp_path),
         VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_STEPS=64,
         VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_ROWS=2,
@@ -271,6 +273,7 @@ def test_selected_rank_install_before_model_load_and_observe_first_sample(api, t
     api.install_sample_diagnostics(runner, envs)
     assert runner.sample is not original
     runner.model, runner.sampler = model, sampler
+    batch.flashmla_diagnostic_id = 7
     result = runner.sample(None, batch, None)
     assert result is seen["result"]
     report = next(tmp_path.glob("*/events.jsonl"))
@@ -278,3 +281,4 @@ def test_selected_rank_install_before_model_load_and_observe_first_sample(api, t
     assert [event["event"] for event in events] == ["armed", "batch", "end"]
     assert all(event["dp_rank"] == 1 and event["tp_rank"] == 0 for event in events)
     assert "compute_logits" not in vars(model) and "sample" not in vars(sampler)
+    assert events[-1]["forward_id"] == 7

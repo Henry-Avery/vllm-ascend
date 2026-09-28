@@ -151,6 +151,8 @@ class NPUModelRunner(GPUModelRunner):
 
         self.update_stream = None
         self.flashmla_executor = DeviceMetadataExecutor() if ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA else None
+        if ascend_envs.VLLM_ASCEND_FLASH_MLA_CHUNK_DIAG and not ascend_envs.VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_DIR:
+            raise ValueError("Chunk diagnostics require VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_DIR")
         if ascend_envs.VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_DIR:
             install_sample_diagnostics(self, ascend_envs)
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
