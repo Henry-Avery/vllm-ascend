@@ -2,7 +2,7 @@
 
 ## 协作规则与当前状态
 
-本文件的技术检查表供实验设计选用，不构成运行授权。主力机/发布机的暂停、人工接管与恢复统一采用[协作协议 v1.3](../collaboration/README.md)；状态见 [PR #10](https://github.com/Henry-Avery/vllm-ascend/pull/10) 最新用户授权和回执。文档更新、提交或新 PR 均不解除暂停。
+本文件的技术检查表供实验设计选用，不构成运行授权。主力机/发布机的暂停、人工接管与恢复统一采用[协作协议 v1.4](../collaboration/README.md)；人工/自动入口和两侧团队遵守[窗口与 Agent Team 工作流](../collaboration/windows-and-agent-teams.md)。状态见 [PR #10](https://github.com/Henry-Avery/vllm-ascend/pull/10) 最新用户授权和回执。文档更新、提交或新 PR 均不解除暂停。
 
 历史起点为 `698d00e7c86eb8a9175c92d384497b28f5b798eb`；`bc83ce0ed` 仅加说明；`f78fe02e8` 为 TRACE 诊断提交。这些不是当前待部署候选，不能自动重跑。
 
