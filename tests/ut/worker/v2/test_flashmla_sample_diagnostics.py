@@ -66,10 +66,11 @@ def case():
         is_prefilling_np=np.array([False, True]),
     )
     runner = SimpleNamespace(model=Model(), sampler=Sampler(), speculative_config=None, batch_sharder=None)
+    runner.hidden_states = torch.tensor([[1.0, 2.0, 3.0], [torch.nan] * 3, [4.0, 5.0, 6.0]])
     seen = {}
 
     def call():
-        logits = runner.model.compute_logits(None)[:2]
+        logits = runner.model.compute_logits(runner.hidden_states[batch.logits_indices])[:2]
         # Grammar-style mutation occurs after compute_logits, before sampler.
         logits[0, 1] = -torch.inf
         sampled, _ = runner.sampler.sample(
@@ -96,7 +97,7 @@ def records(diagnostic):
 def test_raw_inplace_processed_final_mapping_and_identity(api, tmp_path, case):
     runner, batch, call, seen = case
     diagnostic = api.SampleDiagnostics(api.DiagnosticConfig(str(tmp_path)), dp_rank=2, tp_rank=0, global_rank=16)
-    result = diagnostic.run(runner, batch, call)
+    result = diagnostic.run(runner, batch, call, runner.hidden_states)
     assert result is seen["result"]
     assert "sample" not in vars(runner.sampler) and "compute_logits" not in vars(runner.model)
     report = records(diagnostic)[-1]
@@ -136,7 +137,7 @@ def test_budget_stops_observation_and_marks_exhaustion(api, tmp_path, case):
     diagnostic = api.SampleDiagnostics(
         api.DiagnosticConfig(str(tmp_path), steps=1), dp_rank=0, tp_rank=0, global_rank=0
     )
-    diagnostic.run(runner, batch, call)
+    diagnostic.run(runner, batch, call, runner.hidden_states)
     sentinel = object()
     assert diagnostic.run(runner, batch, lambda: sentinel) is sentinel
     assert diagnostic.run(runner, batch, lambda: sentinel) is sentinel
@@ -148,7 +149,7 @@ def test_nonfinite_json_and_invalid_priority(api, tmp_path, case):
     runner, batch, call, _ = case
     runner.model.compute_logits = lambda _: torch.tensor([[1.0, 2.0, 3.0], [float("nan"), float("inf"), -float("inf")]])
     diagnostic = api.SampleDiagnostics(api.DiagnosticConfig(str(tmp_path), rows=1), dp_rank=0, tp_rank=0, global_rank=0)
-    diagnostic.run(runner, batch, call)
+    diagnostic.run(runner, batch, call, runner.hidden_states)
     report = records(diagnostic)[-1]
     assert report["tensor_rows"] == [1]  # Bad second row beats watched token in row 0.
     assert report["rows"][1]["raw"]["nan"] == 1
@@ -176,7 +177,7 @@ def test_unsupported_paths_fail_visibly(api, tmp_path, case, failure):
         capture_check=lambda: failure == "capture",
     )
     with pytest.raises(RuntimeError):
-        diagnostic.run(runner, batch, call)
+        diagnostic.run(runner, batch, call, runner.hidden_states)
     assert records(diagnostic)[-1]["event"] == "error"
 
 
@@ -274,11 +275,69 @@ def test_selected_rank_install_before_model_load_and_observe_first_sample(api, t
     assert runner.sample is not original
     runner.model, runner.sampler = model, sampler
     batch.flashmla_diagnostic_id = 7
-    result = runner.sample(None, batch, None)
+    result = runner.sample(runner.hidden_states, batch, None)
     assert result is seen["result"]
     report = next(tmp_path.glob("*/events.jsonl"))
     events = [json.loads(line) for line in report.read_text().splitlines()]
-    assert [event["event"] for event in events] == ["armed", "batch", "end"]
+    assert [event["event"] for event in events] == [
+        "armed",
+        "batch",
+        "hidden_boundary",
+        "hidden_boundary",
+        "hidden_mapping",
+        "end",
+    ]
     assert all(event["dp_rank"] == 1 and event["tp_rank"] == 0 for event in events)
     assert "compute_logits" not in vars(model) and "sample" not in vars(sampler)
     assert events[-1]["forward_id"] == 7
+
+
+@pytest.mark.parametrize("fault", [None, "model", "mapping", "logits"])
+def test_hidden_boundaries_separate_upstream_mapping_and_head(api, tmp_path, case, fault):
+    runner, batch, call, _ = case
+    hidden = runner.hidden_states.clone()
+    if fault == "model":
+        hidden[2, 0] = torch.nan
+        runner.hidden_states = hidden
+    elif fault == "mapping":
+        runner.hidden_states[2, 0] += 1
+    elif fault == "logits":
+        runner.model.compute_logits = lambda _: torch.full((2, 3), torch.nan)
+    diagnostic = api.SampleDiagnostics(api.DiagnosticConfig(str(tmp_path)), dp_rank=0, tp_rank=0, global_rank=0)
+    diagnostic.run(runner, batch, call, hidden)
+    events = records(diagnostic)
+    boundaries = [event for event in events if event["event"] == "hidden_boundary"]
+    assert [event["stage"] for event in boundaries] == ["model_output", "lm_head_input"]
+    assert boundaries[0]["rows"][0]["nan"] == (1 if fault == "model" else 0)
+    assert boundaries[1]["rows"][0]["nan"] == (1 if fault == "model" else 0)
+    assert next(event["passed"] for event in events if event["event"] == "hidden_mapping") == (fault != "mapping")
+    saved = torch.load(diagnostic.directory / events[-1]["tensor_file"], weights_only=True)
+    assert saved["model_output"].shape == (2, 3)
+    assert events[-1]["rows"][0]["raw"]["nan"] == (3 if fault == "logits" else 0)
+
+
+def test_unselected_forward_does_not_consume_sampler_window(api, tmp_path, case):
+    runner, batch, call, _ = case
+    diagnostic = api.SampleDiagnostics(
+        api.DiagnosticConfig(str(tmp_path), steps=1), dp_rank=0, tp_rank=0, global_rank=0
+    )
+    batch.flashmla_diagnostic_selected = False
+    sentinel = object()
+    for _ in range(1000):
+        assert diagnostic.run(runner, batch, lambda: sentinel) is sentinel
+    assert diagnostic.step == 0 and len(records(diagnostic)) == 1
+    batch.flashmla_diagnostic_selected = True
+    diagnostic.run(runner, batch, call, runner.hidden_states)
+    assert diagnostic.step == 1 and records(diagnostic)[-1]["event"] == "end"
+
+
+def test_hidden_failure_has_snapshot_priority_even_if_logits_are_finite(api, tmp_path, case):
+    runner, batch, call, _ = case
+    runner.hidden_states[0, 0] = torch.nan  # Request-a, after logits_indices selection.
+    diagnostic = api.SampleDiagnostics(api.DiagnosticConfig(str(tmp_path), rows=1), dp_rank=0, tp_rank=0, global_rank=0)
+    diagnostic.run(runner, batch, call, runner.hidden_states)
+    report = records(diagnostic)[-1]
+    assert report["tensor_rows"] == [1]
+    saved = torch.load(diagnostic.directory / report["tensor_file"], weights_only=True)
+    assert torch.isnan(saved["model_output"][0, 0])
+    assert torch.isfinite(saved["raw_logits"]).all()

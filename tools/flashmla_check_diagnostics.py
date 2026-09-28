@@ -49,7 +49,37 @@ def inspect_worker(path, require_history):
     )
     ends = Counter((event.get("forward_id"), event.get("layer")) for event in events if event["event"] == "layer_end")
     samples = {event.get("forward_id"): event for event in sampling if event["event"] == "end"}
+    hidden_required = any(event.get("hidden_boundaries") for event in sampling if event["event"] == "armed")
+    boundaries = Counter(
+        (event.get("forward_id"), event.get("layer"), event.get("stage"))
+        for event in events
+        if event["event"] == "boundary"
+    )
+    hidden = Counter(
+        (event.get("forward_id"), event.get("stage")) for event in sampling if event["event"] == "hidden_boundary"
+    )
+    boundary_layers = {event["forward_id"]: event["layers"] for event in events if event["event"] == "boundary_layers"}
     for forward, batch in batches.items():
+        if armed.get("configuration", {}).get("scan_all_mla_layers"):
+            if not boundary_layers.get(forward):
+                gaps.append(f"forward {forward}: no expected MLA boundary layer list")
+            for layer in boundary_layers.get(forward, []):
+                for stage in ("mla_input", "mla_output"):
+                    if boundaries[forward, layer, stage] != 1:
+                        gaps.append(f"forward {forward}, {layer}: missing/duplicate {stage}")
+        if hidden_required:
+            for stage in ("model_output", "lm_head_input"):
+                if hidden[forward, stage] != 1:
+                    gaps.append(f"forward {forward}: missing/duplicate {stage}")
+            for event in sampling:
+                if event["event"] == "hidden_boundary" and event.get("forward_id") == forward:
+                    if [row.get("request_id") for row in event.get("rows", [])] != batch["request_ids"]:
+                        failures.append(f"forward {forward}: hidden boundary request order differs")
+            mappings = [
+                event for event in sampling if event["event"] == "hidden_mapping" and event.get("forward_id") == forward
+            ]
+            if len(mappings) != 1:
+                gaps.append(f"forward {forward}: missing/duplicate hidden row mapping")
         for layer in selected:
             if begins[forward, layer] != 1 or ends[forward, layer] != 1:
                 gaps.append(f"forward {forward}, {layer}: missing/duplicate begin/end")
@@ -65,6 +95,10 @@ def inspect_worker(path, require_history):
             stages.add(event["stage"].split("/")[0])
             if event.get("passed") is not True:
                 failures.append(f"forward {event.get('forward_id')} {event.get('layer')} {event['stage']}")
+        if kind == "boundary" and event.get("passed") is not True:
+            failures.append(f"nonfinite {event['stage']}: forward {event.get('forward_id')} {event.get('layer')}")
+        if kind == "boundary" and event.get("tensor_file") and not (path.parent / event["tensor_file"]).is_file():
+            gaps.append("missing first nonfinite boundary snapshot")
         if kind == "layer_begin" and not event.get("selected_requests"):
             gaps.append("layer has no selected request")
         if kind == "layer_end" and (not event.get("comparisons") or event.get("skipped")):
@@ -78,6 +112,16 @@ def inspect_worker(path, require_history):
             if not tensor_file or not (path.parent / tensor_file).is_file():
                 gaps.append(f"missing attention snapshot for forward {event.get('forward_id')}")
     for event in sampling:
+        if event["event"] == "boundary_skipped":
+            gaps.append(f"sampling boundary skipped: {event.get('stage')}")
+        if event["event"] == "hidden_mapping" and event.get("passed") is not True:
+            failures.append(f"model output/LM-head row mapping differs: forward {event.get('forward_id')}")
+        if event["event"] == "hidden_boundary":
+            for row in event.get("rows", []):
+                if row.get("nan") or row.get("positive_inf") or row.get("negative_inf"):
+                    failures.append(
+                        f"nonfinite {event['stage']}: forward {event.get('forward_id')} {row['request_id']}"
+                    )
         if event["event"] in ("error", "mapping_mismatch"):
             failures.append(f"sampling {event['event']}: {event.get('message', '')}")
         if event["event"] == "budget_exhausted":
@@ -100,6 +144,29 @@ def inspect_worker(path, require_history):
     chunks = [event for event in events if event["event"] == "history_chunk"]
     if require_history and not any(event["length"] > 0 for event in chunks):
         gaps.append("no positive history chunk observed")
+    target_ids = set(armed.get("configuration", {}).get("request_ids", []))
+    observed_ids = {req for batch in batches.values() for req in batch["request_ids"]}
+    if target_ids - observed_ids:
+        gaps.append(f"target request IDs never observed: {sorted(target_ids - observed_ids)}")
+    anomalies = []
+    for event in events + sampling:
+        bad = event.get("passed") is False
+        if event["event"] in ("hidden_boundary", "end"):
+            for row in event.get("rows", []):
+                if event["event"] == "hidden_boundary":
+                    bad |= bool(row.get("nan") or row.get("positive_inf") or row.get("negative_inf"))
+                else:
+                    bad |= any(
+                        row.get(stage, {}).get("nan")
+                        or row.get(stage, {}).get("positive_inf")
+                        or not row.get(stage, {}).get("finite")
+                        for stage in ("raw", "processed")
+                    )
+        if bad:
+            anomalies.append(
+                {key: event[key] for key in ("utc", "forward_id", "layer", "stage", "event", "rows") if key in event}
+            )
+    anomalies.sort(key=lambda event: event.get("utc", ""))
     return dict(
         directory=str(path.parent.parent),
         dp_rank=armed.get("dp_rank"),
@@ -108,6 +175,9 @@ def inspect_worker(path, require_history):
         layers=sorted(selected),
         stages=sorted(stages),
         runtime=runtime,
+        first_observed_anomaly=anomalies[0] if anomalies else None,
+        target_request_ids=sorted(target_ids),
+        all_mla_boundary_scan=bool(armed.get("configuration", {}).get("scan_all_mla_layers")),
         zero_history_observed=any(event["length"] == 0 for event in chunks),
         positive_history_observed=any(event["length"] > 0 for event in chunks),
         failures=failures,

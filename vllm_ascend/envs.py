@@ -51,6 +51,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Default {}. JSON: max_layers=2 (1..8), requests_per_phase=2 (1..8),
     # query_rows=2 (1..4), max_kv_tokens=4096 (1..16384), max_saved_mib=128 (1..1024),
     # layer_names=[] (<=8), request_ids=[] (<=16), atol/rtol=0.05 (finite 0..1).
+    # start_after_forwards=0 (0..1000000), scan_all_mla_layers=false (JSON boolean).
+    # Only matching forwards after the delay consume the attention/sampling budget.
     # Names/IDs are optional exact-match filters, not credentials. Diagnostic only.
     "VLLM_ASCEND_FLASH_MLA_CHUNK_DIAG_CONFIG": lambda: os.getenv("VLLM_ASCEND_FLASH_MLA_CHUNK_DIAG_CONFIG", "{}"),
     # Eager-only numerical sampling diagnostics. Default empty disables all hooks.

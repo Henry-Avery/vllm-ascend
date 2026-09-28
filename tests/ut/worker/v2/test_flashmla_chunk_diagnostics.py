@@ -391,3 +391,121 @@ def test_chunk_switch_is_strict_and_disabled_by_default(monkeypatch):
     monkeypatch.setenv(name, "true")
     with pytest.raises(ValueError):
         env["env_variables"][name]()
+
+
+def test_target_window_and_reused_metadata_are_not_consumed_by_smoke(api, tmp_path):
+    owner, batch, _ = make_case(api, tmp_path, request_ids=("target",), start_after_forwards=2)
+    owner.step = 0
+    metadata = SimpleNamespace(chunk_diagnostics=None)
+    runner = SimpleNamespace(
+        prepare_inputs=lambda: batch,
+        scheduler_config=SimpleNamespace(enable_chunked_prefill=True, max_num_batched_tokens=512),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        model_state=SimpleNamespace(prepare_attn=lambda input_batch: {"layer": metadata}),
+    )
+    owner.install(runner)
+    batch.req_ids[0] = "target"
+    for _ in range(2):
+        runner.prepare_inputs()
+        assert not batch.flashmla_diagnostic_selected
+    batch.req_ids[0] = "decode"
+    for _ in range(998):
+        runner.prepare_inputs()
+        runner.model_state.prepare_attn(batch)
+        assert not batch.flashmla_diagnostic_selected and metadata.chunk_diagnostics is None
+    assert owner.observed_steps == 0
+    batch.req_ids[0] = "target"
+    runner.prepare_inputs()
+    runner.model_state.prepare_attn(batch)
+    assert batch.flashmla_diagnostic_id == 1001 and owner.observed_steps == 1
+    assert metadata.chunk_diagnostics is owner.active_batch
+    batch.req_ids[0] = "unrelated"
+    runner.prepare_inputs()
+    runner.model_state.prepare_attn(batch)
+    assert metadata.chunk_diagnostics is None and owner.observed_steps == 1
+    batch.req_ids[0] = "target"
+    runner.prepare_inputs()
+    assert owner.observed_steps == 2 and batch.flashmla_diagnostic_selected
+    runner.prepare_inputs()
+    assert not batch.flashmla_diagnostic_selected
+    assert sum(event["event"] == "budget_exhausted" for event in records(owner)) == 1
+
+
+def test_all_layer_scan_covers_layer_outside_reference_budget(api, tmp_path):
+    owner, _, layer = make_case(api, tmp_path, max_layers=1, scan_all_mla_layers=True)
+    observed = layer.batch
+    assert observed.begin_layer(layer.impl, "later.layer", layer.meta, layer.cache) is None
+    value = torch.ones(5, 7)
+    value[4] = torch.nan  # Padding never belongs to a request.
+    observed.boundary("later.layer", "mla_input", value)
+    value[3, 0] = torch.nan
+    observed.boundary("later.layer", "mla_output", value)
+    observed.boundary("last.layer", "mla_input", value)
+    events = [event for event in records(owner) if event["event"] == "boundary"]
+    assert [event["passed"] for event in events] == [True, False, False]
+    assert events[1]["rows"][-1]["request_id"] == "new"
+    assert events[1]["tensor_file"] and not events[2]["tensor_file"]
+    assert len(list(owner.directory.glob("*first-boundary-failure.pt"))) == 1
+    observed.boundary("sharded.layer", "mla_input", value[:1])
+    assert records(owner)[-1]["reason"] == "boundary_rows_not_global_or_width"
+
+
+@pytest.mark.parametrize("config", [{"start_after_forwards": -1}, {"scan_all_mla_layers": 1}])
+def test_invalid_capture_window_config(api, config):
+    with pytest.raises(ValueError):
+        api.ChunkDiagnosticConfig(**config)
+
+
+def test_checker_requires_new_boundaries_and_identifies_first_observed_fault(api, checker, tmp_path):
+    owner, batch, layer = make_case(api, tmp_path)
+    add_decode_evidence(api, layer)
+    exercise_prefill(api, layer)
+    write_sample_evidence(owner, batch)
+    sample_path = owner.directory.parent / "events.jsonl"
+    sampling = [json.loads(line) for line in sample_path.read_text().splitlines()]
+    sampling[0]["hidden_boundaries"] = True
+    sample_path.write_text("".join(json.dumps(event) + "\n" for event in sampling))
+    report = checker.check_directory(tmp_path, [0])
+    assert report["exit_code"] == 2 and any("model_output" in gap for gap in report["workers"][0]["gaps"])
+    sampling.extend(
+        [
+            dict(
+                event="hidden_boundary",
+                forward_id=1,
+                stage=stage,
+                utc="2026-09-28T00:00:00Z",
+                rows=[dict(request_id=req, nan=0, positive_inf=0, negative_inf=0) for req in batch.req_ids],
+            )
+            for stage in ("model_output", "lm_head_input")
+        ]
+    )
+    sampling.append(dict(event="hidden_mapping", forward_id=1, passed=True))
+    sample_path.write_text("".join(json.dumps(event) + "\n" for event in sampling))
+    assert checker.check_directory(tmp_path, [0])["exit_code"] == 0
+    sampling[-3]["rows"][1]["nan"] = 1
+    sample_path.write_text("".join(json.dumps(event) + "\n" for event in sampling))
+    report = checker.check_directory(tmp_path, [0])
+    assert report["exit_code"] == 1
+    assert report["workers"][0]["first_observed_anomaly"]["stage"] == "model_output"
+
+
+def test_checker_requires_all_mla_boundaries_and_every_target(api, checker, tmp_path):
+    owner, batch, layer = make_case(api, tmp_path, scan_all_mla_layers=True, request_ids=("continued", "new"))
+    add_decode_evidence(api, layer)
+    exercise_prefill(api, layer)
+    write_sample_evidence(owner, batch)
+    owner.emit("boundary_layers", layers=[layer.name, "later.layer"])
+    for name in (layer.name, "later.layer"):
+        for stage in ("mla_input", "mla_output"):
+            layer.batch.boundary(name, stage, torch.ones(4, 8))
+    # No decode request was selected, so the full run still lacks Flash evidence.
+    report = checker.check_directory(tmp_path, [0])
+    assert not any("mla_input" in gap or "mla_output" in gap for gap in report["workers"][0]["gaps"])
+    events = records(owner)
+    events = [event for event in events if not (event["event"] == "boundary" and event["layer"] == "later.layer")]
+    events[0]["configuration"]["request_ids"].append("absent")
+    (owner.directory / "events.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
+    report = checker.check_directory(tmp_path, [0])
+    assert report["exit_code"] == 2
+    assert any("later.layer" in gap for gap in report["workers"][0]["gaps"])
+    assert any("absent" in gap for gap in report["workers"][0]["gaps"])

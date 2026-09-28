@@ -2357,8 +2357,10 @@ class AscendMLAImpl(MLAAttentionImpl):
             )
 
         diagnostic = None
-        if getattr(attn_metadata, "chunk_diagnostics", None) is not None:
-            diagnostic = attn_metadata.chunk_diagnostics.begin_layer(self, layer_name, attn_metadata, kv_cache)
+        chunk_diagnostics = getattr(attn_metadata, "chunk_diagnostics", None)
+        if chunk_diagnostics is not None:
+            chunk_diagnostics.boundary(layer_name, "mla_input", hidden_states)
+            diagnostic = chunk_diagnostics.begin_layer(self, layer_name, attn_metadata, kv_cache)
 
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
@@ -2432,6 +2434,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             o_proj_input.mul_(torch.sigmoid(gate))
         # O proj
         output[...] = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
+        if chunk_diagnostics is not None:
+            chunk_diagnostics.boundary(layer_name, "mla_output", output)
         if diagnostic is not None:
             diagnostic.finish(o_proj_input, output)
 

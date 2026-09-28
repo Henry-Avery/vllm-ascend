@@ -23,6 +23,7 @@ MAX_WORK_BYTES = 64 * MIB
 BLOCK_SIZE = 128
 MAX_SUCCESS_ELEMENTS = 2048
 MAX_REFERENCE_HEADS = 4
+MAX_HIDDEN_SIZE = 32768
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,8 @@ class ChunkDiagnosticConfig:
     max_saved_mib: int = 128
     layer_names: tuple[str, ...] = ()
     request_ids: tuple[str, ...] = ()
+    start_after_forwards: int = 0
+    scan_all_mla_layers: bool = False
     atol: float = 0.05
     rtol: float = 0.05
 
@@ -44,11 +47,14 @@ class ChunkDiagnosticConfig:
             "query_rows": (1, 4),
             "max_kv_tokens": (1, 16384),
             "max_saved_mib": (1, 1024),
+            "start_after_forwards": (0, 1000000),
         }
         for name, (low, high) in bounds.items():
             value = getattr(self, name)
             if type(value) is not int or not low <= value <= high:
                 raise ValueError(f"Chunk diagnostics require {name}={low}..{high}")
+        if type(self.scan_all_mla_layers) is not bool:
+            raise ValueError("scan_all_mla_layers must be a JSON boolean")
         for name, limit in (("layer_names", 8), ("request_ids", 16)):
             values = getattr(self, name)
             if (
@@ -168,6 +174,8 @@ class ChunkDiagnostics:
         self.directory = sampling_diagnostic.directory / "attention"
         self.directory.mkdir(mode=0o700)
         self.step = 0
+        self.observed_steps = 0
+        self.waiting = False
         self.saved_bytes = 0
         self.layers = []
         self.active_batch = None
@@ -191,7 +199,8 @@ class ChunkDiagnostics:
         if self.saved_bytes + size > self.config.max_saved_mib * MIB:
             self.emit("snapshot_skipped", reason="save_budget", bytes=size, layer_index=layer_index)
             return None
-        name = f"forward{self.step:04d}-layer{layer_index:03d}.pt"
+        suffix = f"{layer_index:03d}" if isinstance(layer_index, int) else layer_index
+        name = f"forward{self.step:04d}-layer{suffix}.pt"
         descriptor = os.open(self.directory / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "wb") as output:
             torch.save(tensors, output)
@@ -216,12 +225,22 @@ class ChunkDiagnostics:
             batch = original_inputs(*args, **kwargs)
             self.step += 1
             batch.flashmla_diagnostic_id = self.step
+            batch.flashmla_diagnostic_selected = False
+            batch.flashmla_diagnostic_request_ids = self.config.request_ids
             self.active_batch = None
-            if self.step <= self.sampling.config.steps:
+            eligible = self.step > self.config.start_after_forwards and (
+                not self.config.request_ids or bool(set(batch.req_ids) & set(self.config.request_ids))
+            )
+            if eligible and self.observed_steps < self.sampling.config.steps:
+                self.observed_steps += 1
+                batch.flashmla_diagnostic_selected = True
                 self.active_batch = DiagnosticBatch(self, batch)
-            elif not self.exhausted:
+            elif eligible and not self.exhausted:
                 self.emit("budget_exhausted", coverage="later forwards are unobserved")
                 self.exhausted = True
+            elif not eligible and not self.waiting:
+                self.emit("waiting_for_window", coverage="unmatched forwards consume no capture budget")
+                self.waiting = True
             state = runner.model_state
             if all(state is not previous for previous in bound_states):
                 original_attn = state.prepare_attn
@@ -231,10 +250,15 @@ class ChunkDiagnostics:
                     bound = inspect.signature(original_attn).bind(*attn_args, **attn_kwargs)
                     result = original_attn(*attn_args, **attn_kwargs)
                     observed = self.active_batch
-                    if observed is not None and bound.arguments["input_batch"] is observed.batch:
-                        for metadata in result.values():
-                            if hasattr(metadata, "chunk_diagnostics"):
-                                metadata.chunk_diagnostics = observed
+                    matches = observed is not None and bound.arguments["input_batch"] is observed.batch
+                    names = []
+                    for name, metadata in result.items():
+                        if hasattr(metadata, "chunk_diagnostics"):
+                            # Clear reused metadata on unobserved forwards too.
+                            metadata.chunk_diagnostics = observed if matches else None
+                            names.append(name)
+                    if matches and self.config.scan_all_mla_layers:
+                        self.emit("boundary_layers", layers=names)
                     return result
 
                 state.prepare_attn = prepare_attn
@@ -256,6 +280,7 @@ class DiagnosticBatch:
         self.state_indices = batch.idx_mapping_np.tolist()
         self.seq_lens_cpu = batch.seq_lens_np[: batch.num_reqs].tolist()
         self.visited = set()
+        self.boundary_dumped = False
         self.owner.emit(
             "batch",
             request_ids=self.requests,
@@ -267,6 +292,44 @@ class DiagnosticBatch:
             prefill_lengths=batch.prefill_len_np.tolist(),
             note="CPU metadata only; compare each layer's actual device inputs",
         )
+
+    def boundary(self, name, stage, value):
+        """Finite checks across MLA layers, independent of expensive references."""
+        if not self.owner.config.scan_all_mla_layers:
+            return
+        if self.owner.sampling.capture_check():
+            raise RuntimeError("Chunk diagnostics cannot execute inside graph capture")
+        requests = [
+            i
+            for i, req in enumerate(self.requests)
+            if not self.owner.config.request_ids or req in self.owner.config.request_ids
+        ][:MAX_REQUESTS]
+        mapping = [
+            (i, self.offsets[i] + row)
+            for i in requests
+            for row in sample_rows(self.offsets[i + 1] - self.offsets[i], self.owner.config.query_rows)
+        ]
+        if value.ndim != 2 or value.shape[0] < self.offsets[-1] or not 0 < value.shape[1] <= MAX_HIDDEN_SIZE:
+            self.owner.emit("check_skipped", layer=name, stage=stage, reason="boundary_rows_not_global_or_width")
+            return
+        selected = cpu(value[[row for _, row in mapping]])
+        rows = []
+        for (req, index), row in zip(mapping, selected):
+            rows.append(
+                dict(
+                    request_id=self.requests[req],
+                    token_row=index,
+                    nan=int(torch.isnan(row).sum()),
+                    positive_inf=int(torch.isposinf(row).sum()),
+                    negative_inf=int(torch.isneginf(row).sum()),
+                )
+            )
+        passed = bool(torch.isfinite(selected).all())
+        snapshot = None
+        if not passed and not self.boundary_dumped:
+            snapshot = self.owner.save({"rows": selected}, "first-boundary-failure")
+            self.boundary_dumped = True
+        self.owner.emit("boundary", layer=name, stage=stage, passed=passed, rows=rows, tensor_file=snapshot)
 
     def begin_layer(self, impl, name, metadata, cache):
         owner = self.owner
