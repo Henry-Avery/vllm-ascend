@@ -36,6 +36,14 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Opt in to external FlashMLA for supported A5 dense MLA decode layers.
+    # Prefill retains FIA and the existing BBND cache. Default: 0 (disabled).
+    # Valid values: 0 or 1. Not sensitive. Unsupported configurations fail early.
+    "VLLM_ASCEND_ENABLE_FLASH_MLA": lambda: _strict_binary_env("VLLM_ASCEND_ENABLE_FLASH_MLA"),
+    # Diagnostic logging for FlashMLA metadata and graph submission. Default: 0.
+    # Valid: 0/1. No tensor contents or credentials; emits local device addresses.
+    # Debug only: per-step host logging affects performance; disable for benchmarks.
+    "VLLM_ASCEND_FLASH_MLA_TRACE": lambda: _strict_binary_env("VLLM_ASCEND_FLASH_MLA_TRACE"),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

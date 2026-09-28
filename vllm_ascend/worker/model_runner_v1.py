@@ -22,7 +22,7 @@ import math
 import sys
 import time
 from collections import defaultdict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
@@ -78,6 +78,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -115,7 +116,13 @@ from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     maybe_create_ubatch_slices,
 )
-from vllm.v1.worker.utils import AttentionGroup, raise_if_nan_logits, select_common_block_size
+from vllm.v1.worker.utils import (
+    AttentionGroup,
+    prepare_kernel_block_sizes,
+    raise_if_nan_logits,
+)
+
+from vllm_ascend import envs as ascend_envs
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
@@ -125,6 +132,7 @@ from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBu
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import (
+    MLA_FLASH_SUPPORTED_Q_HEADS,
     AscendCommonAttentionMetadata,
     get_sfa_qsfa_packed_head_dim,
     using_paged_attention,
@@ -207,6 +215,7 @@ from vllm_ascend.utils import (
     model_uses_kpool_indexer,
     set_potential_max_tokens,
     should_skip_allreduce_across_dp_group,
+    vllm_version_is,
     weak_ref_tensor,
     weak_ref_tensors,
 )
@@ -226,6 +235,9 @@ from vllm_ascend.worker.utils import (
     AscendKVBlockZeroer,
     copy_kv_cache_blocks_inplace,
     disable_compilation,
+    get_single_raw_mla_backing,
+    make_page_strided_cache_view,
+    row_major_strides,
 )
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 
@@ -602,7 +614,7 @@ class NPUModelRunner(GPUModelRunner):
             pin_memory=self.pin_memory,
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[self.block_size],
-            kernel_block_sizes=[[self.cache_config.block_size]],
+            kernel_block_sizes=[self.cache_config.block_size],
             is_spec_decode=bool(self.vllm_config.speculative_config),
             logitsprocs=build_logitsprocs(
                 self.vllm_config,
@@ -3409,7 +3421,7 @@ class NPUModelRunner(GPUModelRunner):
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         has_initial_state = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
-        if self.use_dcp or self.model_config.is_hybrid:
+        if self.use_dcp or self.model_config.is_hybrid or ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
             # Mamba prompt chunks must retain prefill state semantics even when
             # their width matches the speculative decode graph. DCP also
             # requires the full prompt to be computed before uniform decode.
@@ -3434,6 +3446,13 @@ class NPUModelRunner(GPUModelRunner):
             else len(self.input_batch.lora_id_to_lora_request)
         )
         has_lora = num_active_loras > 0 if force_has_lora is None else force_has_lora
+        flashmla_prefill = (
+            ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA
+            and force_uniform_decode is None
+            and np.any(
+                self.input_batch.num_computed_tokens_cpu[:num_reqs] < self.input_batch.num_prompt_tokens[:num_reqs]
+            )
+        )
 
         # ruff: noqa: E731
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
@@ -3445,7 +3464,7 @@ class NPUModelRunner(GPUModelRunner):
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
                 valid_modes=valid_modes,
-                invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                invalid_modes={CUDAGraphMode.FULL} if disable_full or flashmla_prefill else None,
                 num_active_loras=num_active_loras,
             )
 
@@ -3831,6 +3850,10 @@ class NPUModelRunner(GPUModelRunner):
             )
 
             extra_attn_metadata_args: dict[str, Any] = {}
+            if getattr(builder, "flashmla_state", None) is not None:
+                # FULL execution must preserve the schedule's ExternalEvent
+                # frontier across capture and replay.
+                extra_attn_metadata_args["retain_for_graph"] = cudagraph_runtime_mode == CUDAGraphMode.FULL
             if isinstance(builder, GDNAttentionMetadataBuilder) and not is_gdn_noop:
                 assert ubid is None, "UBatching not supported with GDN yet"
                 extra_attn_metadata_args["num_actual_reqs"] = num_reqs
@@ -4684,7 +4707,11 @@ class NPUModelRunner(GPUModelRunner):
         # old first-spec scan over attn_groups cannot recognize them.
         self.need_accepted_tokens = kv_cache_config.has_mamba_layers
 
-        self.may_reinitialize_input_batch(kv_cache_config)
+        kernel_block_sizes = prepare_kernel_block_sizes(
+            kv_cache_config, self.attn_groups
+        )
+        self.kernel_block_sizes = kernel_block_sizes
+        self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
         if self.sparse_kv_offload_enabled:
             self.sparse_kv_offload_manager = init_sparse_kv_offload_manager(
                 self.vllm_config,
@@ -4693,6 +4720,7 @@ class NPUModelRunner(GPUModelRunner):
             )
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config,
+            kernel_block_sizes=kernel_block_sizes,
             kv_cache_allocation_context=kv_cache_allocation_context,
         )
         if any(is_circular_kv_cache_spec(g.kv_cache_spec) for g in kv_cache_config.kv_cache_groups):
@@ -4727,9 +4755,7 @@ class NPUModelRunner(GPUModelRunner):
                     int(size[0] if isinstance(size, (list, tuple)) else size) for size in sizes
                 ]
             else:
-                draft_kernel_block_sizes = (
-                    kernel_block_sizes[0] if isinstance(kernel_block_sizes, list) else kernel_block_sizes
-                )
+                draft_kernel_block_sizes = kernel_block_sizes
             self.drafter.initialize_attn_backend(kv_cache_config, draft_kernel_block_sizes)
 
         if (
@@ -4768,6 +4794,7 @@ class NPUModelRunner(GPUModelRunner):
     def initialize_kv_cache_tensors(
         self,
         kv_cache_config: KVCacheConfig,
+        kernel_block_sizes: list[int] | None = None,
         kv_cache_allocation_context: AbstractContextManager | None = None,
     ) -> dict[str, torch.Tensor]:
         """
@@ -4785,7 +4812,9 @@ class NPUModelRunner(GPUModelRunner):
         with allocation_context:
             kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
         # Change the memory buffer to the desired shape
-        kv_caches = self._reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)
+        kv_caches = self._reshape_kv_cache_tensors(
+            kv_cache_config, kv_cache_raw_tensors, kernel_block_sizes
+        )
 
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
@@ -4855,6 +4884,37 @@ class NPUModelRunner(GPUModelRunner):
         ) and (
             self.use_compress
             or getattr(kv_cache_spec, "indexes_kv_by_block_stride", False)
+        )
+
+    def _uses_single_raw_mla_cache(
+        self,
+        layer_name: str,
+        kv_cache_spec: KVCacheSpec,
+        attn_module: AttentionLayerBase | None = None,
+        *,
+        use_legacy_shared_by_layout: bool = False,
+    ) -> bool:
+        """Whether this runner can expose an MLA layer from one raw backing."""
+        if not isinstance(kv_cache_spec, AscendMLAAttentionSpec):
+            return False
+        if not kv_cache_spec.supports_single_raw_backing:
+            return False
+        # Runtime-only exclusions do not need the static forward context. In
+        # particular, sparse layerwise tests synthesize a runner without it.
+        if (
+            use_legacy_shared_by_layout
+            or self.vllm_config.kv_transfer_config is not None
+            or self.use_sparse
+            or self.sparse_kv_offload_enabled
+            or self.use_compress
+        ):
+            return False
+        if attn_module is None:
+            attn_module = self.compilation_config.static_forward_context.get(layer_name)
+        return (
+            isinstance(attn_module, MLAAttention)
+            and getattr(attn_module, "indexer", None) is None
+            and not getattr(attn_module.impl, "fa_quant_layer", False)
         )
 
     def _get_attention_kv_cache_dims(self, layer_name: str, kv_cache_spec: AttentionSpec) -> tuple[int, int]:
@@ -4993,6 +5053,7 @@ class NPUModelRunner(GPUModelRunner):
                 for name in allocation.layers:
                     kv_cache_raw_tensors[name] = backing
             return kv_cache_raw_tensors
+        use_legacy_shared_by_layout = vllm_version_is("0.28.0")
         uses_padded_page_layout = requires_padded_page_layout(layer_kv_cache_spec.values())
         is_dsv4_main = any(
             getattr(spec, "model_version", None) == "deepseek_v4"
@@ -5004,6 +5065,18 @@ class NPUModelRunner(GPUModelRunner):
         self.hybrid_with_attn_and_mamba = any(
             isinstance(spec, MambaSpec) for spec in layer_kv_cache_spec.values()
         ) and any(isinstance(spec, AttentionSpec) for spec in layer_kv_cache_spec.values())
+        strided_attention_cache_layers: set[str] = set()
+        if (
+            not self.use_sparse
+            and not self.use_compress
+            and not self.sparse_kv_offload_enabled
+        ):
+            strided_attention_cache_layers = {
+                layer_name
+                for layer_name, spec in layer_kv_cache_spec.items()
+                if type(spec) is FullAttentionSpec
+                and not is_hidden_state_cache_spec(spec)
+            }
 
         # GLM-Next emits one descriptor for each physical cache slot. Layers
         # listed by a descriptor deliberately alias that slot even when they
@@ -5149,6 +5222,7 @@ class NPUModelRunner(GPUModelRunner):
                 if (
                     "linear_attn" in layer_name
                     or self.hybrid_with_attn_and_mamba
+                    or layer_name in strided_attention_cache_layers
                     or "cache_only_layers" in layer_name
                     or is_hidden_state_cache_spec(layer_kv_cache_spec.get(layer_name))
                 ) and layer_name not in kv_cache_raw_tensors:
@@ -5234,6 +5308,23 @@ class NPUModelRunner(GPUModelRunner):
                     current_sparse_sfa_c8 = self.use_sparse and kv_cache_spec_uses_sparse_sfa_c8(
                         current_kv_cache_spec
                     )
+                    is_single_raw_mla = self._uses_single_raw_mla_cache(
+                        layer_name,
+                        current_kv_cache_spec,
+                        use_legacy_shared_by_layout=use_legacy_shared_by_layout,
+                    )
+                    # 纯MLA在这里为当前layer分配single raw backing；hybrid MLA
+                    # 使用上方standardized shared backing生成的bare raw tensor。
+                    # is_single_raw_mla只基于当前layer判断，不能推广到shared_layers。
+                    if is_single_raw_mla:
+                        fused_raw_size = (
+                            kv_cache_config.num_blocks
+                            * current_kv_cache_spec.page_size_bytes
+                        )
+                        kv_cache_raw_tensors[layer_name] = (
+                            self._allocate_int8_cache_tensor(fused_raw_size, alignment),
+                        )
+                        continue
 
                     # vLLM #51718 packs every layer of a group into a single
                     # KVCacheTensor on main; the per-layer size is the block
@@ -5310,7 +5401,7 @@ class NPUModelRunner(GPUModelRunner):
     def _adjust_kv_layout(
         self,
         raw_tensor: torch.Tensor,
-        kv_cache_shape_list: list[tuple[int, ...]],
+        kv_cache_shape_list: Sequence[tuple[int, ...]],
         kv_cache_dtype_list: list[int],
         page_size_bytes: int,
         overlap_full_kv_cache: bool = False,
@@ -5318,24 +5409,20 @@ class NPUModelRunner(GPUModelRunner):
     ):
         reshaped_kv_tensors = []
         assert raw_tensor.element_size() == 1
-        base_storage_offset_bytes = raw_tensor.storage_offset() + initial_offset_bytes
-        storage_offset_bytes = base_storage_offset_bytes
+        base_offset_bytes = initial_offset_bytes
+        storage_offset_bytes = base_offset_bytes
         for idx, (shape, dtype) in enumerate(zip(kv_cache_shape_list, kv_cache_dtype_list)):
             if overlap_full_kv_cache and idx == 2:
-                storage_offset_bytes = base_storage_offset_bytes
+                storage_offset_bytes = base_offset_bytes
             dtype_size = get_dtype_size(dtype)
-            num_element_per_page = (
-                page_size_bytes // dtype_size
-            )
+            stride = row_major_strides(shape)
 
-            stride = torch.empty(shape).stride()
-            target_stride = (num_element_per_page, *stride[1:])
-            assert storage_offset_bytes % dtype_size == 0
-            tensor = torch.as_strided(
-                raw_tensor.view(dtype),
-                size=shape,
-                stride=target_stride,
-                storage_offset=storage_offset_bytes // dtype_size,
+            tensor = make_page_strided_cache_view(
+                raw_tensor,
+                shape,
+                dtype,
+                page_size_bytes,
+                storage_offset_bytes,
             )
             reshaped_kv_tensors.append(tensor)
             storage_offset_bytes += stride[0] * dtype_size
@@ -5346,6 +5433,7 @@ class NPUModelRunner(GPUModelRunner):
         self,
         kv_cache_config: KVCacheConfig,
         kv_cache_raw_tensors: dict[str, torch.Tensor],
+        kernel_block_sizes: list[int] | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Reshape the KV cache tensors to the desired shape and dtype.
@@ -5371,6 +5459,14 @@ class NPUModelRunner(GPUModelRunner):
         is_glm5_next = any(is_glm5_next_cache_spec(spec) for spec in layer_kv_cache_spec.values())
 
         for group in self._kv_cache_spec_attn_group_iterator():
+            group_kernel_block_size = None
+            if kernel_block_sizes is not None:
+                if group.kv_cache_group_id >= len(kernel_block_sizes):
+                    # The last group may contain layers without KV cache.
+                    continue
+                group_kernel_block_size = kernel_block_sizes[
+                    group.kv_cache_group_id
+                ]
             attn_backend = group.backend
             current_kv_cache_spec = group.kv_cache_spec
             for layer_name in group.layer_names:
@@ -5378,6 +5474,9 @@ class NPUModelRunner(GPUModelRunner):
                     continue
 
                 current_kv_cache_spec = layer_kv_cache_spec[layer_name]
+                kernel_block_size = (
+                    group_kernel_block_size or current_kv_cache_spec.block_size
+                )
 
                 if layer_name in layer_tuple_strides:
                     block_stride = layer_tuple_strides[layer_name]
@@ -5565,6 +5664,82 @@ class NPUModelRunner(GPUModelRunner):
                         )
                         kv_caches[layer_name] = reshaped_tensors
                         continue
+
+                    # MLA使用allocate/hybrid阶段的一整块raw backing。
+                    # A5FlashMLA消费token交错的单tensor；A3 FIA消费component-major 双view。MHA/GQA继续走raw K/V协议。
+                    raw_cache = kv_cache_raw_tensors[layer_name]
+                    fused_raw_tensor = get_single_raw_mla_backing(raw_cache)
+
+                    # Only a single-backing Ascend MLA cache needs module-level
+                    # metadata. Legacy MHA/GQA K/V tuples keep the raw K/V path.
+                    attn_module = None
+                    if (
+                        fused_raw_tensor is not None
+                        and isinstance(current_kv_cache_spec, AscendMLAAttentionSpec)
+                    ):
+                        attn_module = self.compilation_config.static_forward_context.get(layer_name)
+
+                    if (
+                        fused_raw_tensor is not None
+                        and self._uses_single_raw_mla_cache(
+                            layer_name,
+                            current_kv_cache_spec,
+                            attn_module,
+                        )
+                    ):
+                        dtype = current_kv_cache_spec.dtype
+                        manager_block_size = current_kv_cache_spec.block_size
+                        kernel_block_size = self.kernel_block_sizes[group.kv_cache_group_id][0]
+                        kernel_blocks_per_manager = manager_block_size // kernel_block_size
+                        physical_page_bytes = current_kv_cache_spec.page_size_bytes
+                        slot_bytes = physical_page_bytes // kernel_blocks_per_manager
+                        nope_dim, rope_dim = self._get_attention_kv_cache_dims(
+                            layer_name, current_kv_cache_spec
+                        )
+                        fused_dim = nope_dim + rope_dim
+                        component_shape = (
+                            kv_cache_config.num_blocks * kernel_blocks_per_manager,
+                            kernel_block_size,
+                            current_kv_cache_spec.num_kv_heads,
+                        )
+                        if (
+                            get_current_hardware_profile().supports(HardwareCapability.MLA_FLASH)
+                            and current_kv_cache_spec.num_heads in MLA_FLASH_SUPPORTED_Q_HEADS
+                        ):
+                            # A5每个kernel slot内按token交错存储[nope|rope]：
+                            # token0[nope|rope], token1[nope|rope], ...。
+                            fused_cache = make_page_strided_cache_view(
+                                fused_raw_tensor,
+                                (*component_shape, fused_dim),
+                                dtype,
+                                slot_bytes,
+                            )
+                            kv_caches[layer_name] = fused_cache
+                            continue
+
+                        # A3/FIA要求nope和rope各自内部连续，只允许首轴携带
+                        # page padding stride。每个kernel slot物理上按
+                        # [all nope][all rope][padding]写入。
+                        nope_cache = make_page_strided_cache_view(
+                            fused_raw_tensor,
+                            (*component_shape, nope_dim),
+                            dtype,
+                            slot_bytes,
+                        )
+                        rope_cache = make_page_strided_cache_view(
+                            fused_raw_tensor,
+                            (*component_shape, rope_dim),
+                            dtype,
+                            slot_bytes,
+                            offset_bytes=(
+                                kernel_block_size
+                                * current_kv_cache_spec.num_kv_heads
+                                * nope_dim
+                                * get_dtype_size(dtype)
+                            ),
+                        )
+                        kv_caches[layer_name] = (nope_cache, rope_cache)
+                        continue
                     raw_kv_is_combined = False
                     if self.use_sparse and "cache_only_layers" not in layer_name:
                         raw_cache = kv_cache_raw_tensors[layer_name]
@@ -5579,14 +5754,24 @@ class NPUModelRunner(GPUModelRunner):
                             raw_k_tensor, raw_v_tensor = raw_cache
                             sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
                     elif (
-                        self.hybrid_with_attn_and_mamba
+                        not self.hybrid_with_attn_and_mamba
                         and "cache_only_layers" not in layer_name
                         and not is_hidden_state_cache_spec(current_kv_cache_spec)
                         and isinstance(kv_cache_raw_tensors[layer_name], torch.Tensor)
                     ):
+                        raw_k_tensor = raw_v_tensor = kv_cache_raw_tensors[layer_name]
+                        sum_page_size_bytes = raw_k_tensor.numel()
+                        raw_kv_is_combined = True
+                    elif (
+                        self.hybrid_with_attn_and_mamba
+                        and "cache_only_layers" not in layer_name
+                        and not is_hidden_state_cache_spec(current_kv_cache_spec)
+                        and isinstance(kv_cache_raw_tensors[layer_name], torch.Tensor)
+                        and self.use_hybrid_blocks
+                    ):
                         # Currently, we ensure that the same kvcache format is used even if there
                         # is no shared layer, such as the full attention mtp layer of qwen3.5, etc.
-                        raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[layer_name], kv_cache_raw_tensors[layer_name]
+                        raw_k_tensor = raw_v_tensor = kv_cache_raw_tensors[layer_name]
                         sum_page_size_bytes = raw_k_tensor.numel()
                         raw_kv_is_combined = True
                     elif (
@@ -5649,23 +5834,56 @@ class NPUModelRunner(GPUModelRunner):
                     # the min of all `num_blocks`. Verify it here.
                     assert num_blocks >= kv_cache_config.num_blocks
 
-                    if hasattr(attn_backend, "get_supported_kernel_block_sizes") and self.use_hybrid_blocks:
-                        block_size = attn_backend.get_supported_kernel_block_sizes()[0]
-
-                        block_size_chunk = current_kv_cache_spec.block_size // block_size
-                        kv_cache_shape = attn_backend.get_kv_cache_shape(
-                            num_blocks * block_size_chunk,
-                            block_size,
-                            current_kv_cache_spec.num_kv_heads,
-                            current_kv_cache_spec.head_size,
-                        )
-                    else:
-                        kv_cache_shape = attn_backend.get_kv_cache_shape(
-                            num_blocks,
-                            current_kv_cache_spec.block_size,
-                            current_kv_cache_spec.num_kv_heads,
-                            current_kv_cache_spec.head_size,
-                        )
+                    block_size_chunk = (
+                        current_kv_cache_spec.block_size // kernel_block_size
+                    )
+                    kv_cache_shape = attn_backend.get_kv_cache_shape(
+                        num_blocks * block_size_chunk,
+                        kernel_block_size,
+                        current_kv_cache_spec.num_kv_heads,
+                        current_kv_cache_spec.head_size,
+                    )
+                    if (
+                        raw_kv_is_combined
+                        and len(kv_cache_shape) == 5
+                        and kv_cache_shape[0] == 2
+                    ):
+                        raw_typed = raw_k_tensor.view(current_kv_cache_spec.dtype)
+                        if raw_typed.numel() == math.prod(kv_cache_shape):
+                            hidden_size = math.prod(kv_cache_shape[2:])
+                            dense_strides = [
+                                math.prod(kv_cache_shape[dim + 1 :])
+                                for dim in range(len(kv_cache_shape))
+                            ]
+                            kv_cache = torch.as_strided(
+                                raw_typed,
+                                size=kv_cache_shape,
+                                stride=(
+                                    hidden_size,
+                                    2 * hidden_size,
+                                    *dense_strides[2:],
+                                ),
+                                storage_offset=raw_typed.storage_offset(),
+                            )
+                            kv_caches[layer_name] = kv_cache
+                            # TODO: Remove this temporary observation point once
+                            # the non-contiguous KV-cache layout is mature.
+                            logger.debug(
+                                "[non-contiguous-kv-cache] attention mode=%s "
+                                "layer=%s shape=%s stride=%s "
+                                "k_contiguous=%s v_contiguous=%s",
+                                (
+                                    "hybrid"
+                                    if self.hybrid_with_attn_and_mamba
+                                    else "gqa"
+                                ),
+                                layer_name,
+                                tuple(kv_cache.shape),
+                                kv_cache.stride(),
+                                kv_cache[0].is_contiguous(),
+                                kv_cache[1].is_contiguous(),
+                            )
+                            continue
                     should_trim_page_padding = (
                         self.hybrid_with_attn_and_mamba and self.use_hybrid_blocks
                     ) or (
@@ -5798,6 +6016,43 @@ class NPUModelRunner(GPUModelRunner):
                     # different GPUs, and `kv_cache_config.num_blocks` is set to
                     # the min of all `num_blocks`. Verify it here.
 
+                    uses_same_raw_tensor = any(
+                        other_layer_name != layer_name
+                        and other_raw_tensor is raw_tensor
+                        for other_layer_name, other_raw_tensor in (
+                            kv_cache_raw_tensors.items()
+                        )
+                    )
+                    if (
+                        self.hybrid_with_attn_and_mamba
+                        and not uses_same_raw_tensor
+                    ):
+                        shapes_with_blocks = tuple(
+                            (num_blocks, *shape)
+                            for shape in current_kv_cache_spec.shapes
+                        )
+                        state_tensors = self._adjust_kv_layout(
+                            raw_tensor,
+                            shapes_with_blocks,
+                            current_kv_cache_spec.dtypes,
+                            current_kv_cache_spec.page_size_bytes,
+                        )
+                        kv_caches[layer_name] = state_tensors
+                        # TODO: Remove this temporary observation point once
+                        # the non-contiguous KV-cache layout is mature.
+                        logger.debug(
+                            "[non-contiguous-kv-cache] mamba mode=hybrid "
+                            "layer=%s page_size_bytes=%s shapes=%s strides=%s "
+                            "storage_offsets=%s contiguous=%s",
+                            layer_name,
+                            current_kv_cache_spec.page_size_bytes,
+                            [tuple(tensor.shape) for tensor in state_tensors],
+                            [tensor.stride() for tensor in state_tensors],
+                            [tensor.storage_offset() for tensor in state_tensors],
+                            [tensor.is_contiguous() for tensor in state_tensors],
+                        )
+                        continue
+
                     state_tensors = []
                     target_idx = 0
                     start_idx = 0
@@ -5822,7 +6077,11 @@ class NPUModelRunner(GPUModelRunner):
 
         return kv_caches
 
-    def may_reinitialize_input_batch(self, kv_cache_config: KVCacheConfig) -> None:
+    def may_reinitialize_input_batch(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kernel_block_sizes: list[int],
+    ) -> None:
         """
         Re-initialize the input batch if the block sizes are different from
         `[self.cache_config.block_size]`. This usually happens when there
@@ -5838,40 +6097,6 @@ class NPUModelRunner(GPUModelRunner):
         ]
         block_sizes = [group.kv_cache_spec.block_size for group in non_encoder_groups]
 
-        # Generate kernel_block_sizes that matches each block_size
-        # For attention backends that support virtual block splitting,
-        # use the supported block sizes from the backend
-        # For other backends (like Mamba), use [0] (no splitting)
-        self.kernel_block_sizes = []
-        for kv_cache_group_id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
-            kv_cache_spec = kv_cache_group.kv_cache_spec
-            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-                # All layers in the UniformTypeKVCacheSpecs have the same type,
-                # Pick an arbitrary one to dispatch.
-                kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
-            if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
-                continue
-            elif is_circular_kv_cache_spec(kv_cache_spec):
-                self.kernel_block_sizes.append([kv_cache_spec.block_size])
-            elif isinstance(kv_cache_spec, AttentionSpec):
-                # This is an attention backend that supports virtual
-                # block splitting. Get the supported block sizes from
-                # the backend.
-                attn_groups = self.attn_groups[kv_cache_group_id]
-                backends = [attn_group.backend for attn_group in attn_groups]
-                kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
-                selected_kernel_size = select_common_block_size(
-                    kv_manager_block_size, backends
-                )
-                self.kernel_block_sizes.append([selected_kernel_size])
-            else:
-                # This is likely Mamba or other non-attention cache,
-                # no splitting.
-                # NOTE: set kernel_block_sizes to 0 to disable slotmapping computation
-                # of mamba block. In this case, BlockTable.block_size will never equal
-                # to kernel_block_sizes[0]
-                self.kernel_block_sizes.append([0])
-
         max_num_blocks = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
         for kv_cache_group in non_encoder_groups:
@@ -5882,7 +6107,7 @@ class NPUModelRunner(GPUModelRunner):
             max_num_blocks.append(max_num_blocks_per_req)
 
         if (block_sizes != [self.cache_config.block_size]
-                or self.kernel_block_sizes != [[self.cache_config.block_size]]
+                or kernel_block_sizes != [self.cache_config.block_size]
                 or len(kv_cache_config.kv_cache_groups) > 1):
             assert self.offload_config.uva.cpu_offload_gb == 0, (
                 "Cannot re-initialize the input batch when CPU weight "
@@ -5905,7 +6130,7 @@ class NPUModelRunner(GPUModelRunner):
                     if self.vllm_config.speculative_config
                     else 0
                 ),
-                kernel_block_sizes=self.kernel_block_sizes,
+                kernel_block_sizes=kernel_block_sizes,
                 max_num_blocks_per_req=max_num_blocks,
                 kv_cache_groups=kv_cache_config.kv_cache_groups,
                 cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
@@ -6029,7 +6254,7 @@ class NPUModelRunner(GPUModelRunner):
             for attn_groups in self.attn_groups
             for attn_group in attn_groups
             for builder in attn_group.metadata_builders
-            if isinstance(builder, DeviceMetadataTaskProvider)
+            if isinstance(builder, DeviceMetadataTaskProvider) and getattr(builder, "uses_device_metadata", True)
         }
         if device_metadata_providers:
             self.device_metadata_executor = DeviceMetadataExecutor()
@@ -6102,6 +6327,7 @@ class NPUModelRunner(GPUModelRunner):
                         dtype = self.kv_cache_dtype
                     kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
                         block_size=self.block_size,
+                        num_heads=attn_module.num_heads,
                         num_kv_heads=1,
                         head_size=head_size,
                         dtype=dtype,
@@ -6132,6 +6358,7 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
                         block_size=spec.block_size,
+                        num_heads=attn_module.num_heads,
                         num_kv_heads=spec.num_kv_heads,
                         head_size=head_size,
                         dtype=dtype,
