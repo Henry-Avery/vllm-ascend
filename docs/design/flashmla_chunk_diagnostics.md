@@ -38,9 +38,12 @@ PR #10 的 FIA 路径保留零历史行，最后统一合并所有分段。
 | 全层边界 / LM-head | 可选全 MLA 输入/输出有限性、首个坏边界快照；model output 与 LM-head 实际输入逐请求比较 |
 | projection / sampling | 采样行的投影前后快照与有限性，沿 forward_id 关联既有 raw/processed logits 和最终 token |
 
-writer 目前直接对照 prefill 写入；decode 提供 metadata 和 attention 结果检查，
-没有独立重算 decode writer 源值。投影只记录及检查有限性，没有重算权重矩阵乘法。
-这两项不能报告为完整算子正确性证明。
+Prefill/Decode writer 新增 raw KV → CPU FP32 RMSNorm/RoPE → 写后缓存的独立参考，
+同时检查最多 32 个未写 slot 哨兵。原 Prefill 返回 K/V 精确对照仍保留。
+RoPE 使用实际 cos/sin，未独立从 position 重算；哨兵不能证明所有非目标缓存未变化。
+投影只记录及检查有限性，没有重算权重矩阵乘法。
+另在 gather 前从 request registry 冻结映射，核对排序后六项字段；
+记录实际 DP/MoE/padding 与有界 dummy 入口，缺字段不当作已验证。
 
 ## 发布机拉取候选
 
@@ -98,7 +101,7 @@ max_kv_tokens 1–16384，max_saved_mib 1–1024；layer_names 最多 8 项，re
 `start_after_forwards` 默认 0，范围 0–1000000，各 worker 独立跳过指定数量真实 forward；
 `scan_all_mla_layers` 默认 false，只接受 JSON boolean，推荐本轮 true。
 atol/rtol 默认均为 0.05，范围有限的 0–1；这是排查容差，不是模型精度验收标准。
-metadata、writer 和 gather 使用精确比较。
+metadata、Prefill 返回 K/V、gather 和未写哨兵使用精确比较；独立 norm/RoPE writer 参考使用上述容差。
 
 采集窗口继承 SAMPLE_DIAG_STEPS（默认 64，最多 128 个匹配窗口的真实 forward）；
 启动 profile/dummy 不占该窗口；开始门槛之前/请求未命中的 forward 也不占预算。
@@ -152,9 +155,12 @@ python -m pytest -q --confcutdir=tests/ut/worker/v2 \
 CPU 用例包含非连续缓存、非零 offset、跨页尾段、零历史 NaN 输出与合法 `-inf` LSE、
 混合请求、有限但错误的 writer/gather/FIA/merge、metadata 错位、预算与采集缺失。
 新增回归包含目标窗口不被 smoke 耗尽、复用 metadata 清除、参考层之外的 NaN、
-模型与 LM-head 行映射、padding 排除及新边界缺失。本次 worker 诊断 57 项、attention contract/lifecycle 44 项，合计 101 项 CPU 回归通过；
-`bash format.sh ci` 全部通过。
+模型与 LM-head 行映射、padding 排除及新边界缺失。停止本地测试指令前，worker 诊断 69 项通过；attention contract/lifecycle 的 44 项为父版本记录，
+本次未重跑。按用户要求将后续测试移至 NPU，不能把父版本成绩继承为新候选结果。
 真实 FIA/FlashMLA/NPU 行为尚未执行，必须由设备运行确认。
 
 关于直接借鉴 1 号的理由、硬限制与仍不明确的地方，见
 [逐项采用复核表](flashmla_plan1_adoption_review.md)。
+
+新增 [旧方案复核清单](flashmla_oldline_review_checklist.md) 与
+[四机矩阵、短 profiler 和停止条件](flashmla_four_node_validation.md)。

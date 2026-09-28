@@ -60,6 +60,20 @@ def inspect_worker(path, require_history):
     )
     boundary_layers = {event["forward_id"]: event["layers"] for event in events if event["event"] == "boundary_layers"}
     for forward, batch in batches.items():
+        if runtime and runtime.get("independent_mapping"):
+            registry = [
+                event for event in events if event["event"] == "request_registry" and event.get("forward_id") == forward
+            ]
+            if len(registry) != 1:
+                gaps.append(f"forward {forward}: missing/duplicate request registry check")
+        if runtime and runtime.get("dispatch_evidence"):
+            context = [
+                event for event in events if event["event"] == "forward_context" and event.get("forward_id") == forward
+            ]
+            if len(context) != 1:
+                gaps.append(f"forward {forward}: missing/duplicate dispatch context")
+            elif context[0].get("moe_comm_type") is None:
+                gaps.append(f"forward {forward}: unknown MoE dispatch method")
         if armed.get("configuration", {}).get("scan_all_mla_layers"):
             if not boundary_layers.get(forward):
                 gaps.append(f"forward {forward}: no expected MLA boundary layer list")
@@ -95,6 +109,10 @@ def inspect_worker(path, require_history):
             stages.add(event["stage"].split("/")[0])
             if event.get("passed") is not True:
                 failures.append(f"forward {event.get('forward_id')} {event.get('layer')} {event['stage']}")
+        if kind == "request_registry" and event.get("passed") is not True:
+            failures.append(f"request registry mismatch: forward {event.get('forward_id')}")
+        if kind == "writer_error":
+            failures.append(f"writer exception: forward {event.get('forward_id')} {event.get('stage')}")
         if kind == "boundary" and event.get("passed") is not True:
             failures.append(f"nonfinite {event['stage']}: forward {event.get('forward_id')} {event.get('layer')}")
         if kind == "boundary" and event.get("tensor_file") and not (path.parent / event["tensor_file"]).is_file():
@@ -137,6 +155,8 @@ def inspect_worker(path, require_history):
                 if summary.get("nan") or summary.get("positive_inf") or not summary.get("finite"):
                     failures.append(f"invalid {stage} logits: forward {event.get('forward_id')} {row['request_id']}")
     required = {"writer", "current", "merge", "flash"}
+    if runtime and runtime.get("writer_references"):
+        required |= {"prefill_writer", "decode_writer", "writer_guard"}
     if require_history:
         required |= {"gather", "history"}
     if required - stages:

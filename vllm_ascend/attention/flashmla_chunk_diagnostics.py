@@ -11,6 +11,7 @@ import inspect
 import json
 import math
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
@@ -24,6 +25,8 @@ BLOCK_SIZE = 128
 MAX_SUCCESS_ELEMENTS = 2048
 MAX_REFERENCE_HEADS = 4
 MAX_HIDDEN_SIZE = 32768
+MAX_GUARD_SLOTS = 32
+MAX_PADDING_TOKENS = 65536
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,39 @@ class ChunkDiagnosticConfig:
 
 def cpu(value):
     return value.detach().to(device="cpu").clone()
+
+
+def reference_kv(raw, weight, epsilon, use_rope, cos=None, sin=None):
+    """Independent FP32 RMSNorm and interleaved RoPE; no cache writes."""
+    width = weight.numel()
+    latent, positional = raw[..., :width].float(), raw[..., width:].float()
+    latent = latent * torch.rsqrt(latent.square().mean(-1, keepdim=True) + epsilon) * weight.float()
+    if use_rope and positional.shape[-1]:
+        if positional.shape[-1] % 2 or cos is None or sin is None:
+            raise ValueError("RoPE reference requires even width and explicit cos/sin")
+        even, odd = positional[..., ::2], positional[..., 1::2]
+        positional = torch.cat((even, odd), -1) * cos.float() + torch.cat((-odd, even), -1) * sin.float()
+    return latent, positional
+
+
+def snapshot_request_sources(runner, scheduler):
+    """Read identity from the registry before batch sorting, not idx_mapping."""
+    states = runner.req_states
+    result = []
+    for req, scheduled in scheduler.num_scheduled_tokens.items():
+        index = states.req_id_to_index.get(req)
+        index = int(index) if index is not None else None
+        result.append(
+            dict(
+                request_id=req,
+                scheduled=int(scheduled),
+                index=index,
+                reverse_request_id=states.index_to_req_id.get(index),
+                computed_prefill=int(states.num_computed_prefill_tokens[index]) if index is not None else None,
+                prefill_len=int(states.prefill_len.np[index]) if index is not None else None,
+            )
+        )
+    return result
 
 
 def tensor_layout(value):
@@ -176,6 +212,9 @@ class ChunkDiagnostics:
         self.step = 0
         self.observed_steps = 0
         self.waiting = False
+        self.request_sources = None
+        self.execute_calls = 0
+        self.execution_events = 0
         self.saved_bytes = 0
         self.layers = []
         self.active_batch = None
@@ -213,11 +252,70 @@ class ChunkDiagnostics:
         # neither the budget nor a request identity.
         original_inputs = runner.prepare_inputs
         bound_states = []
+        original_gather = getattr(runner, "gather_batch_req_state", None)
+        if original_gather is not None:
+
+            @wraps(original_gather)
+            def gather(*args, **kwargs):
+                bound = inspect.signature(original_gather).bind(*args, **kwargs)
+                bound.apply_defaults()
+                scheduler = bound.arguments["scheduler_output"]
+                self.request_sources = None
+                if (
+                    not bound.arguments["dummy_run"]
+                    and len(scheduler.num_scheduled_tokens) <= MAX_REQUESTS
+                    and self.step >= self.config.start_after_forwards
+                    and self.observed_steps < self.sampling.config.steps
+                    and (
+                        not self.config.request_ids
+                        or set(scheduler.num_scheduled_tokens) & set(self.config.request_ids)
+                    )
+                ):
+                    self.request_sources = snapshot_request_sources(runner, scheduler)
+                return original_gather(*args, **kwargs)
+
+            runner.gather_batch_req_state = gather
+        original_execute = getattr(runner, "execute_model", None)
+        if original_execute is not None:
+
+            @wraps(original_execute)
+            def execute(*args, **kwargs):
+                bound = inspect.signature(original_execute).bind(*args, **kwargs)
+                bound.apply_defaults()
+                self.execute_calls += 1
+                # Include dummy/DP synchronization calls in a bounded host timeline.
+                scheduler = bound.arguments["scheduler_output"]
+                observing = (
+                    self.step >= self.config.start_after_forwards
+                    and self.observed_steps < self.sampling.config.steps
+                    and self.execution_events < 2 * self.sampling.config.steps
+                    and (
+                        not self.config.request_ids
+                        or set(scheduler.num_scheduled_tokens) & set(self.config.request_ids)
+                        or (bound.arguments.get("dummy_run") and self.observed_steps > 0)
+                    )
+                )
+                if observing:
+                    self.execution_events += 1
+                    self.emit(
+                        "execute_call",
+                        execute_id=self.execute_calls,
+                        dummy=bool(bound.arguments.get("dummy_run", False)),
+                        profile=bool(bound.arguments.get("is_profile", False)),
+                        scheduled_tokens=int(scheduler.total_num_scheduled_tokens),
+                    )
+                with torch.profiler.record_function(f"flashmla.execute/{self.execute_calls}"):
+                    return original_execute(*args, **kwargs)
+
+            runner.execute_model = execute
         self.emit(
             "runtime",
             chunked_prefill=runner.scheduler_config.enable_chunked_prefill,
             prefix_caching=runner.cache_config.enable_prefix_caching,
             max_num_batched_tokens=runner.scheduler_config.max_num_batched_tokens,
+            independent_mapping=original_gather is not None,
+            writer_references=True,
+            dispatch_evidence=True,
         )
 
         @wraps(original_inputs)
@@ -235,6 +333,7 @@ class ChunkDiagnostics:
                 self.observed_steps += 1
                 batch.flashmla_diagnostic_selected = True
                 self.active_batch = DiagnosticBatch(self, batch)
+                self.active_batch.check_request_sources(self.request_sources)
             elif eligible and not self.exhausted:
                 self.emit("budget_exhausted", coverage="later forwards are unobserved")
                 self.exhausted = True
@@ -248,7 +347,8 @@ class ChunkDiagnostics:
                 @wraps(original_attn)
                 def prepare_attn(*attn_args, **attn_kwargs):
                     bound = inspect.signature(original_attn).bind(*attn_args, **attn_kwargs)
-                    result = original_attn(*attn_args, **attn_kwargs)
+                    with torch.profiler.record_function(f"flashmla.prepare_attn/{self.step}"):
+                        result = original_attn(*attn_args, **attn_kwargs)
                     observed = self.active_batch
                     matches = observed is not None and bound.arguments["input_batch"] is observed.batch
                     names = []
@@ -281,6 +381,7 @@ class DiagnosticBatch:
         self.seq_lens_cpu = batch.seq_lens_np[: batch.num_reqs].tolist()
         self.visited = set()
         self.boundary_dumped = False
+        self.context_recorded = False
         self.owner.emit(
             "batch",
             request_ids=self.requests,
@@ -290,7 +391,68 @@ class DiagnosticBatch:
             request_state_indices=self.state_indices,
             seq_lens_cpu=self.seq_lens_cpu,
             prefill_lengths=batch.prefill_len_np.tolist(),
+            execute_id=owner.execute_calls,
             note="CPU metadata only; compare each layer's actual device inputs",
+        )
+
+    def check_request_sources(self, sources):
+        if sources is None:
+            self.owner.emit("check_skipped", stage="request_registry", reason="pre_sort_snapshot_unavailable")
+            return
+        expected = {row["request_id"]: row for row in sources}
+        checks = []
+        for i, req in enumerate(self.requests):
+            row = expected.get(req, {})
+            passed = (
+                row.get("index") == self.state_indices[i]
+                and row.get("reverse_request_id") == req
+                and row.get("scheduled") == self.offsets[i + 1] - self.offsets[i]
+                and row.get("computed_prefill") == self.history[i]
+                and row.get("prefill_len") == int(self.batch.prefill_len_np[i])
+                and bool(self.batch.is_prefilling_np[i]) == (self.history[i] < int(self.batch.prefill_len_np[i]))
+            )
+            checks.append(dict(request_id=req, passed=passed))
+        phases = self.batch.is_prefilling_np.tolist()
+        self.owner.emit(
+            "request_registry",
+            passed=all(row["passed"] for row in checks)
+            and set(expected) == set(self.requests)
+            and phases == sorted(phases),
+            scheduler_order=sources,
+            decode_before_prefill=phases == sorted(phases),
+            batch_order=self.requests,
+            checks=checks,
+        )
+
+    def record_context(self, extra, context):
+        if self.context_recorded:
+            return
+        self.context_recorded = True
+        dp_metadata = getattr(context, "dp_metadata", None)
+        dp_tokens = getattr(dp_metadata, "num_tokens_across_dp_cpu", None)
+        if dp_tokens is None:
+            dp_tokens = getattr(extra, "num_tokens_across_dp", None)
+        tokens = None
+        if isinstance(dp_tokens, torch.Tensor) and dp_tokens.numel() <= MAX_REQUESTS:
+            tokens = cpu(dp_tokens).reshape(-1).tolist()
+        comm = getattr(extra, "moe_comm_type", None)
+        padding = getattr(self.batch, "is_padding", None)
+        padding_summary = None
+        if isinstance(padding, torch.Tensor) and padding.numel() <= MAX_PADDING_TOKENS:
+            padding_cpu = cpu(padding).reshape(-1)
+            padding_summary = dict(
+                tokens=int(padding_cpu.sum()),
+                first_indices=padding_cpu.nonzero().reshape(-1)[:MAX_GUARD_SLOTS].tolist(),
+            )
+        self.owner.emit(
+            "forward_context",
+            execute_id=self.owner.execute_calls,
+            num_actual_tokens=self.offsets[-1],
+            num_tokens_after_padding=getattr(self.batch, "num_tokens_after_padding", None),
+            padding=padding_summary,
+            dp_tokens=tokens,
+            moe_comm_type=getattr(comm, "name", str(comm)) if comm is not None else None,
+            note="Missing fields are unknown; this is dispatch metadata, not proof of a collective kernel",
         )
 
     def boundary(self, name, stage, value):
@@ -510,6 +672,154 @@ class LayerObservation:
             self.skip(stage, "reference_input_budget", kv_tokens=length, estimated_bytes=size)
             return False
         return True
+
+    @contextmanager
+    def watch_writer(self, phase, raw, cos, sin, slots):
+        """Freeze inputs/untouched sentinels before the real writer executes."""
+        stage = f"{phase}_writer"
+        prepared = self.prepare_writer_reference(phase, raw, cos, sin, slots)
+        try:
+            with torch.profiler.record_function(f"flashmla.writer/{self.owner.step}/{self.name}/{phase}"):
+                yield
+        except Exception as error:
+            self.emit("writer_error", stage=stage, error_type=type(error).__name__)
+            raise
+        if prepared is None:
+            return
+        entries, guard_slots, guards = prepared
+        for req, row, slot, expected in entries:
+            for component, cache, reference in zip(("latent", "positional"), self.cache, expected):
+                actual = cpu(cache[slot // BLOCK_SIZE, slot % BLOCK_SIZE]).reshape(-1)
+                self.check(
+                    f"{stage}/{req}/{row}/{component}",
+                    actual,
+                    reference.reshape(-1),
+                    request_id=self.batch.requests[req],
+                    slot=slot,
+                )
+        for index, (cache, before) in enumerate(zip(self.cache, guards)):
+            after = self.read_slots(cache, guard_slots)
+            # Bytes preserve unchanged NaN payloads and signed zero in unused KV.
+            self.check(
+                f"writer_guard/{phase}/{index}",
+                after.contiguous().view(torch.uint8),
+                before.contiguous().view(torch.uint8),
+                exact=True,
+                slots=guard_slots,
+            )
+
+    @staticmethod
+    def read_slots(cache, slots):
+        indices = torch.tensor(slots, dtype=torch.long, device=cache.device)
+        return cpu(cache[indices // BLOCK_SIZE, indices % BLOCK_SIZE])
+
+    def prepare_writer_reference(self, phase, raw, cos, sin, slots):
+        # Only sampled source rows and bounded untouched sentinels leave device.
+        impl = self.impl
+        stage = f"{phase}_writer"
+        norm = getattr(impl, "kv_a_layernorm", None)
+        if (
+            norm is None
+            or getattr(impl, "fa_quant_layer", False)
+            or getattr(impl, "enable_kv_nz", False)
+            or any(cache.ndim != 4 or cache.shape[1] != BLOCK_SIZE or cache.shape[2] != 1 for cache in self.cache)
+        ):
+            self.skip(stage, "unsupported_writer_reference")
+            return None
+        slot_values = cpu(slots).reshape(-1).tolist()
+        offset = self.meta.num_decode_tokens if phase == "prefill" else 0
+        rows = [
+            (req, row)
+            for req in self.selected
+            if (req >= self.meta.num_decodes) == (phase == "prefill")
+            for row in (
+                self.batch.offsets[req] + i
+                for i in sample_rows(self.batch.offsets[req + 1] - self.batch.offsets[req], self.config.query_rows)
+            )
+        ]
+        capacity = self.cache[0].shape[0] * BLOCK_SIZE
+        raw_width = self.cache[0].shape[-1] + self.cache[1].shape[-1]
+        if raw.ndim != 2 or raw.shape[-1] != raw_width or raw.shape[0] > len(slot_values):
+            self.skip(stage, "writer_input_shape")
+            return None
+        weight = cpu(norm.weight).reshape(-1)
+        if weight.numel() != self.cache[0].shape[-1]:
+            self.skip(stage, "norm_weight_shape")
+            return None
+        entries = []
+        for req, row in rows:
+            local = row - offset
+            if not 0 <= local < raw.shape[0] or not 0 <= slot_values[local] < capacity:
+                self.skip(stage, "invalid_source_row_or_slot", row=row)
+                continue
+            source = cpu(raw[local]).reshape(1, -1)
+            c = cpu(cos[local]).reshape(1, -1) if impl.use_mla_rope and cos is not None else None
+            s = cpu(sin[local]).reshape(1, -1) if impl.use_mla_rope and sin is not None else None
+            if (
+                impl.use_mla_rope
+                and self.cache[1].shape[-1]
+                and (
+                    c is None
+                    or s is None
+                    or c.shape[-1] != self.cache[1].shape[-1]
+                    or s.shape != c.shape
+                    or c.shape[-1] % 2
+                )
+            ):
+                self.skip(stage, "unsupported_rope_shape")
+                continue
+            expected = reference_kv(source, weight, norm.variance_epsilon, impl.use_mla_rope, c, s)
+            position = (
+                self.seq_lens[req]
+                - (self.batch.offsets[req + 1] - self.batch.offsets[req])
+                + row
+                - self.batch.offsets[req]
+            )
+            if 0 <= position // BLOCK_SIZE < len(self.table[req]):
+                expected_slot = self.table[req][position // BLOCK_SIZE] * BLOCK_SIZE + position % BLOCK_SIZE
+                self.check(
+                    f"{stage}/{req}/{row}/slot",
+                    torch.tensor(slot_values[local]),
+                    torch.tensor(expected_slot),
+                    exact=True,
+                )
+            else:
+                self.skip(stage, "position_outside_table", request_id=self.batch.requests[req])
+            entries.append((req, row, slot_values[local], expected))
+            self.keep(f"{stage}/{req}/{row}/source", source)
+            if c is not None:
+                self.keep(f"{stage}/{req}/{row}/cos", c)
+                self.keep(f"{stage}/{req}/{row}/sin", s)
+        written = {int(slot) for slot in slot_values if 0 <= slot < capacity}
+        candidates = {
+            neighbor
+            for slot in written
+            for neighbor in (slot - 1, slot + 1)
+            if 0 <= neighbor < capacity and neighbor not in written
+        }
+        written_pages = {slot // BLOCK_SIZE for slot in written}
+        page_candidates = {0, self.cache[0].shape[0] - 1} | {page + 1 for page in written_pages}
+        for page in sorted(page_candidates):
+            if 0 <= page < self.cache[0].shape[0] and page not in written_pages:
+                candidates.update(page * BLOCK_SIZE + i for i in (0, BLOCK_SIZE // 2, BLOCK_SIZE - 1))
+                break
+        ordered = sorted(candidates)
+        guard_slots = [ordered[i] for i in sample_rows(len(ordered), MAX_GUARD_SLOTS)]
+        if not guard_slots:
+            self.skip("writer_guard", "no_untouched_slots")
+        guards = [self.read_slots(cache, guard_slots) for cache in self.cache]
+        self.emit(
+            "writer_inputs",
+            phase=phase,
+            selected_rows=[row for _, row in rows],
+            slots=slot_values,
+            guard_slots=guard_slots,
+            use_mla_rope=bool(impl.use_mla_rope),
+            epsilon=float(norm.variance_epsilon),
+            cache_layouts=[tensor_layout(cache) for cache in self.cache],
+        )
+        self.keep(f"{stage}/norm_weight", weight)
+        return entries, guard_slots, guards
 
     def writer(self, latent, positional):
         num_decode_tokens = self.meta.num_decode_tokens

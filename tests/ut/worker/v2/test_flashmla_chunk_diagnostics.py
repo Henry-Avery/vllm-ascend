@@ -509,3 +509,180 @@ def test_checker_requires_all_mla_boundaries_and_every_target(api, checker, tmp_
     assert report["exit_code"] == 2
     assert any("later.layer" in gap for gap in report["workers"][0]["gaps"])
     assert any("absent" in gap for gap in report["workers"][0]["gaps"])
+
+
+def test_cpu_norm_interleaved_rope_has_independent_expected_values(api):
+    raw = torch.tensor([[3.0, 4.0, 1.0, 2.0, 3.0, 4.0]])
+    weight = torch.tensor([2.0, 3.0])
+    latent, positional = api.reference_kv(raw, weight, 0.0, True, torch.zeros(1, 4), torch.ones(1, 4))
+    assert torch.allclose(latent, torch.tensor([[6.0, 12.0]]) / (12.5**0.5))
+    assert torch.equal(positional, torch.tensor([[-2.0, -4.0, 1.0, 3.0]]))
+    _, no_rope = api.reference_kv(raw, weight, 0.0, False)
+    assert torch.equal(no_rope, raw[:, 2:])
+
+
+@pytest.mark.parametrize(
+    "phase,use_rope,fault",
+    [
+        ("decode", False, None),
+        ("decode", True, None),
+        ("prefill", True, None),
+        ("decode", False, "target"),
+        ("prefill", False, "neighbor"),
+    ],
+)
+def test_writer_reference_and_untouched_sentinels(api, tmp_path, phase, use_rope, fault):
+    owner, _, layer = make_case(api, tmp_path)
+    layer.impl.kv_a_layernorm = SimpleNamespace(weight=torch.tensor([2.0, 3.0, 4.0]), variance_epsilon=0.5)
+    layer.impl.use_mla_rope = use_rope
+    raw = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0]]) if phase == "decode" else torch.ones(3, 5)
+    slots = layer.meta.slot_mapping[:1] if phase == "decode" else layer.meta.slot_mapping[1:]
+    cos, sin = torch.zeros(len(raw), 1, 1, 2), torch.ones(len(raw), 1, 1, 2)
+    # Unwritten cache can contain NaN; unchanged bits must pass guard checking.
+    layer.cache[0][3, 1, 0, 0] = torch.nan
+    with layer.watch_writer(phase, raw, cos, sin, slots):
+        latent = raw[:, :3] / (raw[:, :3].square().mean(-1, keepdim=True) + 0.5).sqrt() * torch.tensor([2.0, 3.0, 4.0])
+        positional = torch.stack((-raw[:, 4], raw[:, 3]), -1) if use_rope else raw[:, 3:]
+        layer.cache[0][slots // 128, slots % 128] = latent[:, None]
+        layer.cache[1][slots // 128, slots % 128] = positional[:, None]
+        if fault == "target":
+            layer.cache[0][slots[0] // 128, slots[0] % 128, 0, 0] += 3
+        if fault == "neighbor":
+            guard = next(event["guard_slots"][0] for event in records(owner) if event["event"] == "writer_inputs")
+            layer.cache[0][guard // 128, guard % 128, 0, 0] += 3
+    failures = [event for event in records(owner) if event.get("passed") is False]
+    assert bool(failures) == (fault is not None)
+    if fault == "neighbor":
+        assert any(event["stage"].startswith("writer_guard/") for event in failures)
+    if fault == "target":
+        assert any(event["stage"].startswith("decode_writer/") for event in failures)
+
+
+def test_writer_exception_preserves_original_failure(api, tmp_path):
+    owner, _, layer = make_case(api, tmp_path)
+    with (
+        pytest.raises(ValueError, match="device failure"),
+        layer.watch_writer("decode", torch.ones(1, 5), None, None, torch.tensor([386])),
+    ):
+        raise ValueError("device failure")
+    assert records(owner)[-1]["event"] == "writer_error"
+
+
+def test_registry_detects_shared_cpu_device_mapping_error(api, tmp_path):
+    owner, batch, layer = make_case(api, tmp_path)
+    states = SimpleNamespace(
+        req_id_to_index=dict(zip(batch.req_ids, [4, 2, 7])),
+        index_to_req_id={4: "decode", 2: "continued", 7: "new"},
+        num_computed_prefill_tokens=np.array([0, 0, 130, 0, 2, 0, 0, 0]),
+        prefill_len=SimpleNamespace(np=np.array([0, 0, 132, 0, 2, 0, 0, 1])),
+    )
+    scheduler = SimpleNamespace(num_scheduled_tokens={"continued": 2, "new": 1, "decode": 1})
+    sources = api.snapshot_request_sources(SimpleNamespace(req_states=states), scheduler)
+    layer.batch.check_request_sources(sources)
+    assert records(owner)[-1]["passed"]
+    batch.idx_mapping_np[0] = 7
+    batch.idx_mapping[0] = 7
+    observed = api.DiagnosticBatch(owner, batch)
+    observed.check_request_sources(sources)
+    assert records(owner)[-1]["passed"] is False
+    assert not records(owner)[-1]["checks"][0]["passed"]
+    states.index_to_req_id[4] = "wrong_owner"
+    layer.batch.check_request_sources(api.snapshot_request_sources(SimpleNamespace(req_states=states), scheduler))
+    assert records(owner)[-1]["passed"] is False
+
+
+def test_forward_context_serializes_padding_and_dispatch_once(api, tmp_path):
+    owner, batch, layer = make_case(api, tmp_path)
+    batch.is_padding = torch.tensor([False, False, False, False, True])
+    batch.num_tokens_after_padding = 5
+    extra = SimpleNamespace(moe_comm_type=SimpleNamespace(name="ALLTOALL"))
+    context = SimpleNamespace(dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=torch.tensor([4, 0, 3, 0])))
+    layer.batch.record_context(extra, context)
+    layer.batch.record_context(extra, context)
+    events = [event for event in records(owner) if event["event"] == "forward_context"]
+    assert len(events) == 1
+    assert events[0]["dp_tokens"] == [4, 0, 3, 0]
+    assert events[0]["padding"] == {"tokens": 1, "first_indices": [4]}
+    assert events[0]["moe_comm_type"] == "ALLTOALL"
+
+
+def test_scratch_descriptor_variants_and_full_backing_mask():
+    path = Path(__file__).resolve().parents[4] / "tools/flashmla_writer_probe.py"
+    api = SimpleNamespace(**runpy.run_path(str(path)))
+    backing, cache, direct = api.make_views(81408, "direct")
+    _, _, rebuilt = api.make_views(81408, "singleton_rebuilt")
+    assert direct[0].stride()[2] == 576 and rebuilt[0].stride()[2] == 512
+    assert direct[1].stride()[2] == 576 and rebuilt[1].stride()[2] == 64
+    mask = api.untouched_mask(backing.numel(), [255, 0, 1], 81408)
+    before = backing.clone()
+    cache[1, 127] = 3
+    cache[0, :2] = 4
+    assert torch.equal(before[mask], backing[mask])
+    assert int((~mask).sum()) == 3 * 576
+    backing[-1] = 9
+    assert not torch.equal(before[mask], backing[mask])
+
+
+def test_installed_registry_hook_freezes_before_sort_and_dummy_does_not_consume(api, tmp_path):
+    owner, batch, _ = make_case(api, tmp_path)
+    owner.step = 0
+    scheduler = SimpleNamespace(
+        num_scheduled_tokens={"continued": 2, "new": 1, "decode": 1}, total_num_scheduled_tokens=4
+    )
+    runner = SimpleNamespace(
+        prepare_inputs=lambda: batch,
+        scheduler_config=SimpleNamespace(enable_chunked_prefill=True, max_num_batched_tokens=512),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        req_states=SimpleNamespace(
+            req_id_to_index={"decode": 4, "continued": 2, "new": 7},
+            index_to_req_id={4: "decode", 2: "continued", 7: "new"},
+            num_computed_prefill_tokens=np.array([0, 0, 130, 0, 2, 0, 0, 0]),
+            prefill_len=SimpleNamespace(np=np.array([0, 0, 132, 0, 2, 0, 0, 1])),
+        ),
+        model_state=SimpleNamespace(prepare_attn=lambda input_batch: {}),
+    )
+
+    def gather(scheduler_output, dummy_run=False):
+        # Simulate the same incorrect index getting copied to CPU and device.
+        if not dummy_run:
+            batch.idx_mapping_np[0] = 7
+            batch.idx_mapping[0] = 7
+        return batch
+
+    sentinel = object()
+
+    def execute(scheduler_output, dummy_run=False, is_profile=False):
+        runner.gather_batch_req_state(scheduler_output, dummy_run)
+        if not dummy_run:
+            runner.prepare_inputs()
+        return sentinel
+
+    runner.gather_batch_req_state, runner.execute_model = gather, execute
+    owner.install(runner)
+    assert runner.execute_model(scheduler, dummy_run=True) is sentinel
+    assert owner.observed_steps == 0
+    assert runner.execute_model(scheduler) is sentinel
+    assert owner.observed_steps == 1
+    events = records(owner)
+    assert [event["dummy"] for event in events if event["event"] == "execute_call"] == [True, False]
+    registry = [event for event in events if event["event"] == "request_registry"]
+    assert len(registry) == 1 and not registry[0]["passed"]
+    assert registry[0]["scheduler_order"][0]["request_id"] == "continued"
+
+
+def test_checker_requires_new_writer_registry_and_context_evidence(api, checker, tmp_path):
+    owner, batch, layer = make_case(api, tmp_path)
+    add_decode_evidence(api, layer)
+    exercise_prefill(api, layer)
+    write_sample_evidence(owner, batch)
+    events = records(owner)
+    runtime = next(event for event in events if event["event"] == "runtime")
+    runtime.update(writer_references=True, independent_mapping=True, dispatch_evidence=True)
+    (owner.directory / "events.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
+    report = checker.check_directory(tmp_path, [0])
+    assert report["exit_code"] == 2
+    gaps = report["workers"][0]["gaps"]
+    assert any("registry" in gap for gap in gaps) and any("dispatch" in gap for gap in gaps)
+    assert any("decode_writer" in gap for gap in gaps)
+    owner.emit("request_registry", passed=False)
+    assert checker.check_directory(tmp_path, [0])["exit_code"] == 1

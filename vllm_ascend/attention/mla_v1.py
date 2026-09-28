@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
@@ -8,6 +9,7 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import get_pcp_group
+from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadataBuilder,
@@ -2039,16 +2041,21 @@ class AscendMLAImpl(MLAAttentionImpl):
                 fused_cache.stride(),
                 fused_cache.storage_offset(),
             )
-        latent, _ = flash.adapter.attention(
-            flash.query,
-            fused_cache,
-            block_table=flash.block_table,
-            cache_seqlens=flash.cache_lens,
-            cu_seqlens_q=flash.cu,
-            seqused_q=flash.used_q,
-            metadata=flash.schedule,
-            attn_mask=flash.attn_mask,
-        )
+        with (
+            torch.profiler.record_function(f"flashmla.decode/{diagnostic.owner.step}/{self.layer_name}")
+            if diagnostic
+            else nullcontext()
+        ):
+            latent, _ = flash.adapter.attention(
+                flash.query,
+                fused_cache,
+                block_table=flash.block_table,
+                cache_seqlens=flash.cache_lens,
+                cu_seqlens_q=flash.cu,
+                seqused_q=flash.used_q,
+                metadata=flash.schedule,
+                attn_mask=flash.attn_mask,
+            )
         if envs.VLLM_ASCEND_FLASH_MLA_TRACE:
             logger.info(
                 "[FlashMLA TRACE] event=decode_enqueued layer=%s schedule_ptr=%s output_shape=%s",
@@ -2189,14 +2196,19 @@ class AscendMLAImpl(MLAAttentionImpl):
             cos[:num_actual_prefill_tokens] if cos is not None else None,
             sin[:num_actual_prefill_tokens] if sin is not None else None,
         )
-        prefill_k_pe, prefill_k_c_normed = self.exec_kv_prefill(
-            prefill_kv_no_split,
-            cos[:num_prefill_kv_tokens] if cos is not None else None,
-            sin[:num_prefill_kv_tokens] if sin is not None else None,
-            kv_cache,
-            prefill_slots,
-            attn_metadata=attn_metadata,
-        )
+        with (
+            diagnostic.watch_writer("prefill", prefill_kv_no_split, cos, sin, prefill_slots)
+            if diagnostic
+            else nullcontext()
+        ):
+            prefill_k_pe, prefill_k_c_normed = self.exec_kv_prefill(
+                prefill_kv_no_split,
+                cos[:num_prefill_kv_tokens] if cos is not None else None,
+                sin[:num_prefill_kv_tokens] if sin is not None else None,
+                kv_cache,
+                prefill_slots,
+                attn_metadata=attn_metadata,
+            )
         if diagnostic is not None:
             diagnostic.writer(prefill_k_c_normed, prefill_k_pe)
         prefill_k_nope, prefill_value = (
@@ -2208,7 +2220,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         prefill_k_pe = prefill_k_pe.expand((*prefill_k_nope.shape[:-1], -1))
         return PrefillMLAPreprocessResult(prefill_q_nope, prefill_q_pe, prefill_k_nope, prefill_k_pe, prefill_value)
 
-    def mla_preprocess_decode(self, q_c, kv_no_split, kv_cache, attn_metadata):
+    def mla_preprocess_decode(self, q_c, kv_no_split, kv_cache, attn_metadata, diagnostic=None):
         num_decode_tokens = attn_metadata.num_decode_tokens
         decode_q_c = q_c[:num_decode_tokens]
         cos = attn_metadata.decode.cos
@@ -2230,14 +2242,19 @@ class AscendMLAImpl(MLAAttentionImpl):
             decode_slots = attn_metadata.external_flashmla.slots
         decode_kv_no_split = kv_no_split[:num_decode_tokens]
         return_current_kv = self._decode_requires_current_kv(attn_metadata)
-        kv_result = self.exec_kv_decode(
-            decode_kv_no_split,
-            cos,
-            sin,
-            kv_cache,
-            decode_slots,
-            return_current_kv=return_current_kv,
-        )
+        with (
+            diagnostic.watch_writer("decode", decode_kv_no_split, cos, sin, decode_slots)
+            if diagnostic
+            else nullcontext()
+        ):
+            kv_result = self.exec_kv_decode(
+                decode_kv_no_split,
+                cos,
+                sin,
+                kv_cache,
+                decode_slots,
+                return_current_kv=return_current_kv,
+            )
         decode_k_pe, decode_k_nope = kv_result[:2]
         current_k_pe, current_k_nope = kv_result[2:] if return_current_kv else (None, None)
         return DecodeMLAPreprocessResult(
@@ -2283,7 +2300,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
         # Preprocess for decode tokens
         if has_decode:
-            decode_preprocess_res = self.mla_preprocess_decode(q_c, kv_no_split, kv_cache, attn_metadata)
+            decode_preprocess_res = self.mla_preprocess_decode(
+                q_c, kv_no_split, kv_cache, attn_metadata, diagnostic=diagnostic
+            )
         # Preprocess for prefill tokens
         if has_prefill:
             prefill_preprocess_res = self.mla_preprocess_prefill(
@@ -2359,6 +2378,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         diagnostic = None
         chunk_diagnostics = getattr(attn_metadata, "chunk_diagnostics", None)
         if chunk_diagnostics is not None:
+            chunk_diagnostics.record_context(_EXTRA_CTX, get_forward_context())
             chunk_diagnostics.boundary(layer_name, "mla_input", hidden_states)
             diagnostic = chunk_diagnostics.begin_layer(self, layer_name, attn_metadata, kv_cache)
 

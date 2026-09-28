@@ -75,3 +75,7 @@ B 线新增接线集中在 `attention/flashmla.py`、`attention/flashmla_metadat
 
 生产 Prefill/Decode、空行处理和 merge 算法此次不变；修改的是关闭时不执行的诊断接线。
 [采集配置、预算和运行回执要求](flashmla_chunk_diagnostics.md)给出完整操作方式。
+
+补充复核已整理为[writer、描述符、stream、DP/MoE 与映射检查表](flashmla_oldline_review_checklist.md)。
+本次补上 Prefill/Decode 独立 norm/RoPE writer 参考、未写哨兵、排序前 registry 核对及实际 dispatch 记录；
+设备侧按[四机与短 profiler 方案](flashmla_four_node_validation.md)取证，旧 d7 部署记录不直接复用。
