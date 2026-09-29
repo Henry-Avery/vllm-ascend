@@ -1,0 +1,21 @@
+{
+  "observed_date": "2026-09-29",
+  "upstream_pr_16456": "6151d7821f3f3ff0489c4976a602f99c948d0638",
+  "upstream_pr_14340": "e86c7357247b44ac42613859df32890e350c1d14",
+  "merge_base": "f18d103838b831380d3590df32e0e82d4aa07a9a",
+  "pure_merge": "32ba99d135aa71b924600bfb10cb6ebdbe72a181",
+  "pure_merge_tree": "b0872f240f6209abcce680e0fb113a4428f4131d",
+  "latest_14340_series_base": "caeb1c9cdbd3a44a9fb03495afc786fbb1018f1e",
+  "old_14340_series_base": "7e2c563f5e6ceddb5b0975753013832d356e096e",
+  "old_16456_head": "52bf27c246e3c9c747267cd1dfce3e63e01020d1",
+  "old_and_latest_16456_tree": "610504e4e2a45c4104f68f5f114d490da48e1a24",
+  "plan1_reference": "de31c53dc5b94ff246b17aa198404a082162c2f9",
+  "pr13_fixed_candidate": "b4af8712a4d08e424ca0729acc11e9fe667c44fc",
+  "proposed_paired_vllm": "ced6857afa0ea7b2e3f0846a62e1394e90f15607",
+  "additional_main_merges": [],
+  "pr13_validation_design_sha256": "c2f08481c7b9e82852487676cc223380e4513c8ea6d1f82249439d0805d11464",
+  "pr13_repair_source": "93dbf8f91c0ca3d94e5617b0a1903b0456edc40a",
+  "pr15_followup_parent": "d843e2e5d865926ba27c6d3222993b61db48380f",
+  "pr13_fixed_candidate_role": "Historical comparison before repair; repaired control is pr13_repair_source",
+  "pr15_history_followup_parent": "c9437d55a6aa1f31d0dbeb979b6c40f1074a1917"
+}
