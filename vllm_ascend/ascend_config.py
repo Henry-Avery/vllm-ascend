@@ -1787,6 +1787,9 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     _NON_USER_INPUT_KEYS = {
         # control-flow flag (singleton/cache refresh), not a configuration field
         "refresh",
+        # Consumed by the B-line model-runner probe from VllmConfig; it is
+        # not an AscendConfig field.
+        "bline_diagnostics",
         # Upstream-injected by EngineArgs for the generic GDN/KDA prefill
         # backend selector; Ascend supports only the triton value (FLA kernels
         # run via triton-ascend), and the triton default applies either way

@@ -26,6 +26,7 @@ from vllm.compilation import breakable_cudagraph
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import async_tensor_h2d as async_copy_to_gpu
@@ -46,6 +47,7 @@ from vllm.v1.worker.gpu.model_runner import (
     GPUModelRunner,
 )
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     MoECommType,
@@ -67,9 +69,10 @@ from vllm_ascend.utils import (
     lmhead_tp_enable,
     set_potential_max_tokens,
 )
+from vllm_ascend.worker.device_metadata import DeviceMetadataExecutor
 from vllm_ascend.worker.utils import disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
-from vllm_ascend.worker.v2.attn_utils import build_attn_state
+from vllm_ascend.worker.v2.attn_utils import build_attn_state, flashmla_metadata_scope
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
@@ -143,6 +146,7 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         self.update_stream = None
+        self.flashmla_executor = DeviceMetadataExecutor() if ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA else None
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream = torch.npu.Stream()
 
@@ -320,6 +324,11 @@ class NPUModelRunner(GPUModelRunner):
             static_forward_context=self.compilation_config.static_forward_context,
         )
         self.model_state.kvpp_runtime = self.kvpp
+        if self.vllm_config.additional_config.get("bline_diagnostics", {}).get("enabled", False):
+            # Lazy diagnostic-only loading; disabled serving installs no hooks.
+            from vllm_ascend.worker.v2.bline_diagnostics import install_bline_diagnostics
+
+            install_bline_diagnostics(self, get_forward_context)
 
     @torch.inference_mode()
     def execute_model(
@@ -347,15 +356,23 @@ class NPUModelRunner(GPUModelRunner):
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         self.model_state.kvpp_is_dummy_run = dummy_run or is_profile
-        output = super().execute_model(
-            scheduler_output,
-            intermediate_tensors=intermediate_tensors,
-            dummy_run=dummy_run,
-            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-            is_profile=is_profile,
-            context_len=context_len,
-            valid_dummy_state_slots=valid_dummy_state_slots,
-        )
+        # Initial memory profiling skips attention before KV cache initialization
+        # creates the groups. Other runs still require initialized builders.
+        attn_groups = getattr(self, "attn_groups", None)
+        if attn_groups is None:
+            if not (dummy_run and is_profile and skip_attn_for_dummy_run):
+                raise RuntimeError("MRv2 attention groups are unavailable outside initial memory profiling")
+            attn_groups = ()
+        with flashmla_metadata_scope(attn_groups, self.flashmla_executor):
+            output = super().execute_model(
+                scheduler_output,
+                intermediate_tensors=intermediate_tensors,
+                dummy_run=dummy_run,
+                skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                is_profile=is_profile,
+                context_len=context_len,
+                valid_dummy_state_slots=valid_dummy_state_slots,
+            )
         self.model_state.kvpp_is_dummy_run = False
         self.kvpp.complete_forward()
 
@@ -406,6 +423,23 @@ class NPUModelRunner(GPUModelRunner):
                     int(batch_state.num_scheduled_tokens.max()),
                     batch_state.has_prefill,
                 )
+        # Memory profiling runs before initialize_kv_cache creates the manager.
+        if self.cudagraph_manager is not None:
+            self.cudagraph_manager.flashmla_has_prefill = bool(
+                ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA and batch_state is not None and batch_state.has_prefill
+            )
+        if ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA and batch_state is not None:
+            # Reorder every per-request field before positions, slots, tables
+            # and sampling indices are constructed. A short prompt is prefill.
+            order = np.argsort(batch_state.is_prefilling_np, kind="stable")
+            batch_state = batch_state._replace(
+                req_ids=[batch_state.req_ids[index] for index in order],
+                num_scheduled_tokens=batch_state.num_scheduled_tokens[order],
+                idx_mapping_np=batch_state.idx_mapping_np[order],
+                prefill_len_np=batch_state.prefill_len_np[order],
+                num_computed_prefill_tokens_np=batch_state.num_computed_prefill_tokens_np[order],
+                is_prefilling_np=batch_state.is_prefilling_np[order],
+            )
         return batch_state, uniform_token_count
 
     def _check_finegrained_tp_graph_step(self, cg_mode: CUDAGraphMode) -> None:

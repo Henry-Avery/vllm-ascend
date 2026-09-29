@@ -1868,6 +1868,17 @@ class TestTopLevelSwitchTypeValidation(TestBase):
             init_ascend_config(vc)
 
     @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_bline_diagnostics_remains_available_to_model_runner(self, mock_fix):
+        vc = VllmConfig()
+        diagnostics = {"enabled": True, "max_steps": 32}
+        vc.additional_config = {"bline_diagnostics": diagnostics}
+
+        init_ascend_config(vc)
+
+        self.assertIs(vc.additional_config["bline_diagnostics"], diagnostics)
+
+    @_clean_up
     @patch("vllm_ascend.ascend_config.logger.warning")
     @patch(
         "vllm_ascend.ascend_config.importlib.util.find_spec",
