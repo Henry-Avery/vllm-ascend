@@ -428,7 +428,6 @@ class AscendConfig:
             "multistream_overlap_shared_expert": false,
             "enable_kv_nz": false,
             "enable_mc2_hierarchy_comm": false,
-            "enable_reduce_sample": false,
             "enable_dsa_cp": false,
             "sfa_dcp_force_tmajor_restore": false,
             "enable_force_eplb": false,
@@ -570,7 +569,6 @@ class AscendConfig:
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
-    enable_reduce_sample: bool = False
     enable_dsa_cp: bool = False
     sfa_dcp_force_tmajor_restore: bool = False
     enable_force_eplb: bool = False
@@ -679,6 +677,12 @@ class AscendConfig:
             and vc.model_config.is_moe
         ):
             raise ValueError("enable_force_eplb cannot be mixed with dynamic_eplb.")
+        if self.enable_dsa_cp and vc.parallel_config.prefill_context_parallel_size > 1:
+            raise ValueError(
+                "DSA-CP and PCP cannot be enabled at the same time. "
+                "Use PCP instead: remove enable_dsa_cp from additional_config "
+                "when --prefill-context-parallel-size is greater than 1."
+            )
         self._check_mooncake_c8_kv_cache_quant(vc)
 
         # profiling_chunk vs min_chunk clamp
@@ -740,12 +744,7 @@ class AscendConfig:
 
         if self.enable_dsa_cp:
             tp_size = vc.parallel_config.tensor_parallel_size
-            pcp_size = vc.parallel_config.prefill_context_parallel_size
-            if pcp_size > 1:
-                migration = (
-                    "Prefill context parallelism is already enabled; remove enable_dsa_cp from additional_config."
-                )
-            elif tp_size > 1:
+            if tp_size > 1:
                 migration = (
                     "Consider trying prefill context parallelism with "
                     f"--tensor-parallel-size 1 --prefill-context-parallel-size {tp_size} "
@@ -911,31 +910,15 @@ class AscendConfig:
         if self.mega_moe_max_tokens <= 0:
             raise ValueError(f"mega_moe_max_tokens must be a positive integer, got {self.mega_moe_max_tokens}")
 
-        # Enable optimized reduce sampling scheme. Preserve the safeguards
-        # added on main while consuming the already-validated typed field.
-        if self.enable_reduce_sample:
-            logger.warning_once("enable_reduce_sample is an experimental feature. Use with caution.")
+        # batch-sharded sampling (Model Runner V2) shards the sampler inputs
+        # per TP rank, while lmhead TP overrides NPUModelRunner.sample with a
+        # whole-group LM-head collective path; the two are mutually exclusive.
+        if vc.parallel_config.enable_batch_sharded_sampling:
             if self.finegrained_tp_config.lmhead_tensor_parallel_size > 0:
                 raise ValueError(
-                    "enable_reduce_sample is incompatible with "
+                    "enable_batch_sharded_sampling is incompatible with "
                     "finegrained_tp_config.lmhead_tensor_parallel_size. "
                     "Please disable one of them."
-                )
-            if (
-                self.enable_pcp_embedding_lmhead_weight_sharding
-                and vc.parallel_config.prefill_context_parallel_size > 1
-            ):
-                raise ValueError(
-                    "enable_reduce_sample is incompatible with "
-                    "enable_pcp_embedding_lmhead_weight_sharding when PCP is enabled. "
-                    "Please disable one of them."
-                )
-            kv_transfer_config = getattr(vc, "kv_transfer_config", None)
-            kv_role = getattr(kv_transfer_config, "kv_role", None)
-            if kv_role == "kv_producer":
-                raise ValueError(
-                    "enable_reduce_sample is not supported on PD-disaggregated "
-                    "scenarios. Please disable enable_reduce_sample."
                 )
 
         # mix_placement mutex

@@ -38,7 +38,6 @@
 #include "mc2/dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_weight_nz_tensor_list/grouped_matmul_swiglu_quant_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_v2/grouped_matmul_swiglu_quant_v2_torch_adpt.h"
-#include "attention/lightning_indexer/lightning_indexer_torch_adpt.h"
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "attention/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include "attention/sparse_flash_mla/sparse_flash_mla_torch_adpt.h"
@@ -49,7 +48,6 @@
 #include "attention/fused_scatter_copy_sparse_flash_attention/fused_scatter_copy_sparse_flash_attention_torch_adpt.h"
 #include "attention/lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
 #include "moe/causal_conv1d_v310/causal_conv1d_310_torch_adpt.h"
-#include "attention/recurrent_gated_delta_rule/recurrent_gated_delta_rule_torch_adpt.h"
 #include "attention/recurrent_kda/recurrent_kda_torch_adpt.h"
 #include "attention/chunk_kda_fwd/chunk_kda_fwd_torch_adpt.h"
 #include "attention/kda_gate_cumsum/kda_gate_cumsum_torch_adpt.h"
@@ -702,38 +700,6 @@ npu_copy_and_expand_eagle_inputs(
 
     return {out_input_ids, out_positions, out_is_rejected_token_mask, out_is_masked_token_mask,
             out_new_token_indices, out_hidden_state_mapping};
-}
-
-at::Tensor npu_causal_conv1d_custom(
-    const at::Tensor& output,
-    const at::Tensor& x,
-    const at::Tensor& weight,
-    const at::Tensor& conv_state,
-    const c10::optional<at::Tensor>& bias_opt,
-    const c10::optional<at::Tensor>& query_start_loc_opt,
-    const c10::optional<at::Tensor>& cache_indices_opt,
-    const c10::optional<at::Tensor>& initial_state_mode_opt,
-    const c10::optional<at::Tensor>& num_accepted_tokens_opt,
-    int64_t  activation_mode,
-    int64_t  pad_slot_id,
-    int64_t  run_mode)
-{
-    EXEC_NPU_CMD(aclnnCausalConv1d,
-                    x,
-                    weight,
-                    bias_opt,
-                    conv_state,
-                    query_start_loc_opt,
-                    cache_indices_opt,
-                    initial_state_mode_opt,
-                    num_accepted_tokens_opt,
-                    activation_mode,
-                    pad_slot_id,
-                    run_mode,
-                    output
-                );
-
-    return output;
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_hash(
@@ -2825,21 +2791,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("npu_gemma_rms_norm", torch::kPrivateUse1, &vllm_ascend::npu_gemma_rms_norm);
 
     ops.def(
-        "npu_recurrent_gated_delta_rule(Tensor query, "
-        "                               Tensor key, "
-        "                               Tensor value, "
-        "                               Tensor(a!) state, "
-        "                               *, "
-        "                               Tensor? beta=None, "
-        "                               float? scale=None, "
-        "                               Tensor? actual_seq_lengths=None, "
-        "                               Tensor? ssm_state_indices=None, "
-        "                               Tensor? num_accepted_tokens=None, "
-        "                               Tensor? g=None, "
-        "                               Tensor? gk=None) -> Tensor");
-    ops.impl("npu_recurrent_gated_delta_rule", torch::kPrivateUse1, &vllm_ascend::npu_recurrent_gated_delta_rule);
-
-    ops.def(
         "recurrent_kda(Tensor query, Tensor key, Tensor value, Tensor gate, Tensor beta, "
         "Tensor(a!) initial_state, Tensor cu_seqlens, Tensor ssm_state_indices, Tensor A_log, Tensor dt_bias, *, "
         "Tensor? num_accepted_tokens=None, float scale=0.08838834764831845, "
@@ -3033,22 +2984,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     );
     ops.impl("grouped_matmul_swiglu_quant_v2", torch::kPrivateUse1, &vllm_ascend::grouped_matmul_swiglu_quant_v2);
 
-    ops.def(
-        "npu_lightning_indexer("
-            "Tensor query, Tensor key, Tensor weights, "
-            "*, "
-            "Tensor? actual_seq_lengths_query=None, "
-            "Tensor? actual_seq_lengths_key=None, "
-            "Tensor? block_table=None, "
-            "str layout_query=\"BSND\", str layout_key=\"BSND\", "
-            "int sparse_count=2048, int sparse_mode=3, "
-            "int pre_tokens=9223372036854775807, "
-            "int next_tokens=9223372036854775807, "
-            "bool return_value=False"
-        ") -> (Tensor sparse_indices, Tensor sparse_values)"
-    );
-    ops.impl("npu_lightning_indexer", torch::kPrivateUse1, &vllm_ascend::npu_lightning_indexer);
-
     // k2q_csr: q2k -> k2q CSR (Meta/Hist/RowPrefix/TilePrefix/Scatter)
     ops.def(
         "npu_k2q_csr(Tensor q2k, Tensor cu_seqlens, Tensor cu_block_lens, "
@@ -3227,21 +3162,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor out_is_masked_token_mask, Tensor out_new_token_indices, Tensor out_hidden_state_mapping)"
     );
     ops.impl("npu_copy_and_expand_eagle_inputs", torch::kPrivateUse1, &vllm_ascend::npu_copy_and_expand_eagle_inputs);
-    ops.def(
-        "npu_causal_conv1d_custom(Tensor output, Tensor x, "
-        "                         Tensor weight, "
-        "                         Tensor conv_state, "
-        "                         Tensor? bias_opt, "
-        "                         Tensor? query_start_loc_opt, "
-        "                         Tensor? cache_indices_opt, "
-        "                         Tensor? initial_state_mode_opt, "
-        "                         Tensor? num_accepted_tokens_opt, "
-        "                         int activation_mode, "
-        "                         int pad_slot_id, "
-        "                         int run_mode"
-        ") -> (Tensor output)");
-    ops.impl("npu_causal_conv1d_custom", torch::kPrivateUse1, &vllm_ascend::npu_causal_conv1d_custom);
-
     ops.def(
         "moe_gating_top_k_hash("
         "Tensor x, "

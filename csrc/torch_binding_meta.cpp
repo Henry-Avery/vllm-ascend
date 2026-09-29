@@ -208,41 +208,6 @@ std::tuple<at::Tensor&, at::Tensor&> dispatch_ffn_combine_meta(
     return {out, expert_token_nums};
 }
 
-std::tuple<at::Tensor, at::Tensor> npu_lightning_indexer_meta(
-    const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
-    const c10::optional<at::Tensor> &actual_seq_lengths_query,
-    const c10::optional<at::Tensor> &actual_seq_lengths_key,
-    const c10::optional<at::Tensor> &block_table, c10::string_view layout_query,
-    c10::string_view layout_key, int64_t sparse_count, int64_t sparse_mode,
-    int64_t pre_tokens, int64_t next_tokens, bool return_value)
-{
-    constexpr int64_t DIM_0 = 0;
-    constexpr int64_t DIM_1 = 1;
-    constexpr int64_t DIM_2 = 2;
-
-    TORCH_CHECK(sparse_count > 0, "sparse count should be greater than 0, but now is ", sparse_count);
-
-    std::string query_layout_str = std::string(layout_query);
-    std::string key_layout_str = std::string(layout_key);
-    c10::SymDimVector output_size;
-    if (query_layout_str == "BSND") {
-        output_size = {query.sym_size(DIM_0), query.sym_size(DIM_1), key.sym_size(DIM_2), c10::SymInt(sparse_count)};
-    } else {
-        int n_dim_index = 0;
-        n_dim_index = (key_layout_str == "TND") ? DIM_1 : DIM_2;
-        output_size = {query.sym_size(DIM_0), key.sym_size(n_dim_index), c10::SymInt(sparse_count)};
-    }
-    // construct the output tensor
-    at::Tensor sparse_indices_out = at::empty_symint(output_size, query.options().dtype(at::kInt));
-    at::Tensor sparse_values_out;
-    if (return_value) {
-        sparse_values_out = at::empty_symint(output_size, query.options().dtype(query.dtype()));
-    } else {
-        sparse_values_out = at::empty_symint(c10::SymDimVector{c10::SymInt(0)}, query.options().dtype(query.dtype()));
-    }
-    return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
-}
-
 std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_meta(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
     const at::Tensor &sparse_indices, double scale_value,
@@ -703,23 +668,6 @@ npu_copy_and_expand_eagle_inputs_meta(
             out_new_token_indices, out_hidden_state_mapping};
 }
 
-at::Tensor npu_causal_conv1d_custom_meta(
-    const at::Tensor& output,
-    const at::Tensor& x,
-    const at::Tensor& weight,
-    const at::Tensor& conv_state,
-    const c10::optional<at::Tensor>& bias_opt,
-    const c10::optional<at::Tensor>& query_start_loc_opt,
-    const c10::optional<at::Tensor>& cache_indices_opt,
-    const c10::optional<at::Tensor>& initial_state_mode_opt,
-    const c10::optional<at::Tensor>& num_accepted_tokens_opt,
-    int64_t  activation_mode,
-    int64_t  pad_slot_id,
-    int64_t  run_mode)
-{
-    return output;
-}
-
 at::Tensor npu_causal_conv1d_310_meta(
     const at::Tensor& x,
     const at::Tensor& weight,
@@ -753,25 +701,6 @@ at::Tensor npu_recurrent_gated_delta_rule_310_meta(
 {
 
     at::Tensor output = at::empty_symint(value.sym_sizes(), value.options());
-    return output;
-}
-
-at::Tensor npu_recurrent_gated_delta_rule_meta(
-    const at::Tensor& query,
-    const at::Tensor& key,
-    const at::Tensor& value,
-    at::Tensor& state,
-    const c10::optional<at::Tensor>& beta,
-    const c10::optional<double> scale,
-    const c10::optional<at::Tensor>& actual_seq_lengths,
-    const c10::optional<at::Tensor>& ssm_state_indices,
-    const c10::optional<at::Tensor>& num_accepted_tokens,
-    const c10::optional<at::Tensor>& g,
-    const c10::optional<at::Tensor>& gk)
-{
-
-    auto options = value.options().dtype(at::ScalarType::BFloat16);
-    at::Tensor output = at::empty_symint(value.sym_sizes(), options);
     return output;
 }
 
@@ -2097,8 +2026,6 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("get_physical_device_id", &vllm_ascend::meta::get_physical_device_id_meta);
     //Gemma rmsnorm meta implementation
     ops.impl("npu_gemma_rms_norm", &vllm_ascend::meta::npu_gemma_rms_norm_meta);
-    // recurrent_gated_delta_rule meta implementation
-    ops.impl("npu_recurrent_gated_delta_rule", &vllm_ascend::meta::npu_recurrent_gated_delta_rule_meta);
     ops.impl("recurrent_kda", &vllm_ascend::meta::recurrent_kda_meta);
     ops.impl("dequant_situ_quant", &vllm_ascend::meta::dequant_situ_quant_meta);
     ops.impl("situ_mx_quant", &vllm_ascend::meta::situ_mx_quant_meta);
@@ -2123,8 +2050,6 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("grouped_matmul_swiglu_quant_weight_nz_tensor_list", &vllm_ascend::meta::grouped_matmul_swiglu_quant_weight_nz_tensor_list_meta);
     // Grouped matmul swiglu quant v2
     ops.impl("grouped_matmul_swiglu_quant_v2", &vllm_ascend::meta::grouped_matmul_swiglu_quant_v2_meta);
-    // Lightning indexer
-    ops.impl("npu_lightning_indexer", &vllm_ascend::meta::npu_lightning_indexer_meta);
     // Sparse flash attention
     ops.impl("npu_sparse_flash_attention", &vllm_ascend::meta::npu_sparse_flash_attention_meta);
     ops.impl("npu_sparse_flash_mla_metadata", &vllm_ascend::meta::npu_sparse_flash_mla_metadata_meta);
@@ -2157,8 +2082,6 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_sign_bits_pack", &vllm_ascend::meta::npu_sign_bits_pack_meta);
     // CopyAndExpandEagleInputs
     ops.impl("npu_copy_and_expand_eagle_inputs", &vllm_ascend::meta::npu_copy_and_expand_eagle_inputs_meta);
-    // causal_conv1d_fn
-    ops.impl("npu_causal_conv1d_custom", &vllm_ascend::meta::npu_causal_conv1d_custom_meta);
     ops.impl("moe_gating_top_k_hash", &vllm_ascend::meta::moe_gating_top_k_hash_meta);
     ops.impl("compressor", &vllm_ascend::meta::compressor_meta);
     ops.impl("compressor_metadata", &vllm_ascend::meta::compressor_metadata_meta);
