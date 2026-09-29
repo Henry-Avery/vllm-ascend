@@ -16,5 +16,6 @@
   "pr13_validation_design_sha256": "c2f08481c7b9e82852487676cc223380e4513c8ea6d1f82249439d0805d11464",
   "pr13_repair_source": "93dbf8f91c0ca3d94e5617b0a1903b0456edc40a",
   "pr15_followup_parent": "d843e2e5d865926ba27c6d3222993b61db48380f",
-  "pr13_fixed_candidate_role": "Historical comparison before repair; repaired control is pr13_repair_source"
+  "pr13_fixed_candidate_role": "Historical comparison before repair; repaired control is pr13_repair_source",
+  "pr15_history_followup_parent": "c9437d55a6aa1f31d0dbeb979b6c40f1074a1917"
 }

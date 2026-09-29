@@ -275,3 +275,19 @@ hooks cover cold prefill, history prefill and decode, ordinary/padded LM-head
 sampling, and restoration. These results use CPU launches/fake serving,
 not an installed paired vLLM/NPU service. The actual ModelConfig plan and
 binary manifest must still be generated on the publisher.
+
+## Mixed history and KDA reuse follow-up
+
+After diagnostic head `8340256f`, this append aligns CP1 FlashMLA-prefill
+history selection with Plan1: requests with no KV in a chunk do not enter
+FIA or its LSE merge. Current-segment output is retained for those queries;
+indices are built once from CPU batch metadata. This prevents dependence on
+empty-KV output semantics, without claiming the late-round failure is proven
+caused by FIA. PCP/DCP and non-FlashMLA paths retain their existing behavior.
+
+The device seam now covers mixed history, cold KDA slots containing NaN,
+byte-preserving COW checks and slot3/page174 protection. Bounded diagnostics
+can be armed by a shared marker file after the first six rounds, preserving
+cache reuse in the same service. DP4 and masked-LSE probe coverage remain
+unsupported. See the Chinese [step-by-step run sheet](followup_validation.md).
+CPU checks do not establish installed FLA/native stride or numerical behavior.

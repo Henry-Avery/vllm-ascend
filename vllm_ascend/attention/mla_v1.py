@@ -38,6 +38,7 @@ from vllm_ascend.attention.flashmla import (
     split_flashmla_requests,
 )
 from vllm_ascend.attention.flashmla_metadata import FlashMLADecode, FlashMLAMetadataBuilder
+from vllm_ascend.attention.mla_context import HistoryQuerySelection, build_history_query_selections
 from vllm_ascend.attention.utils import (
     MLAPO_MAX_SUPPORTED_TOKENS,
     AscendCommonAttentionMetadata,
@@ -162,6 +163,7 @@ class ChunkedContextMetadata:
     chunk_seq_lens: torch.Tensor
     chunk_seq_lens_npu: torch.Tensor
     chunk_actual_seq_lengths_kv_list: list[list[int]]
+    history_query_selections: list[HistoryQuerySelection] | None = None
 
 
 @dataclass
@@ -723,6 +725,13 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             chunk_seq_lens_npu=self.chunk_seq_lens.npu(),
             workspace=self.chunked_prefill_workspace,
             chunk_actual_seq_lengths_kv_list=chunk_actual_seq_lengths_kv_list,
+            history_query_selections=(
+                build_history_query_selections(
+                    self.query_lens[reqs_start:num_reqs].tolist(), self.chunk_seq_lens.tolist(), self.device
+                )
+                if envs.VLLM_ASCEND_ENABLE_FLASH_MLA and self.pcp_size == 1 and not enable_dcp()
+                else None
+            ),
         )
 
     def get_block_table_size(self, common_attn_metadata: AscendCommonAttentionMetadata, build_metadata_step: int):
@@ -1417,7 +1426,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         lse_list = [prefix_lse.reshape(num_tokens * H)]
 
         if self.head_padding > 0:
-            query = torch.cat((q_nope, q_pe), dim=-1)
+            padded_query = torch.cat((q_nope, q_pe), dim=-1)
 
         common_kwargs = {
             "num_heads": self.num_heads,
@@ -1432,7 +1441,11 @@ class AscendMLAImpl(MLAAttentionImpl):
             "actual_seq_lengths": actual_seq_lengths_q,
         }
 
+        selections = getattr(prefill_metadata.chunked_context, "history_query_selections", None)
         for i in range(iters):
+            selection = selections[i] if selections is not None else None
+            if selection is not None and not selection.cu_query_lengths:
+                continue
             toks = prefill_metadata.chunked_context.seq_tot[i]
             context_seq_len_npu = self.get_context_seq_len_npu(i, attn_metadata)
             kv_c_normed = torch.empty(toks, num_heads, latent_kv_dim, dtype=cache_kv_c.dtype, device=cache_kv_c.device)
@@ -1478,6 +1491,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             common_kwargs["actual_seq_lengths_kv"] = actual_seq_lengths_kv
 
             if self.head_padding > 0:
+                query = padded_query
                 key = torch.cat((k_nope, k_pe), dim=-1)
             else:
                 # mla_nope_chunked_ctx: with qk_rope_head_dim == 0 the rope
@@ -1489,6 +1503,17 @@ class AscendMLAImpl(MLAAttentionImpl):
                 query = q_nope
                 key = k_nope
 
+            if selection is not None:
+                common_kwargs["actual_seq_lengths"] = selection.cu_query_lengths
+                common_kwargs["actual_seq_lengths_kv"] = selection.cu_kv_lengths
+                # The current segment has already initialized output/LSE for
+                # every query. Only merge rows with history in this chunk.
+                indices = selection.query_indices
+                if indices is not None:
+                    query = query.index_select(0, indices)
+                    if "query_rope" in common_kwargs:
+                        common_kwargs["query_rope"] = q_pe.index_select(0, indices)
+
             chunk_out, chunk_lse = torch_npu.npu_fused_infer_attention_score(
                 query, key.contiguous(), v.contiguous(), **common_kwargs
             )
@@ -1497,9 +1522,28 @@ class AscendMLAImpl(MLAAttentionImpl):
                 chunk_lse = chunk_lse.transpose(0, 1).unsqueeze(-1)
             chunk_out = chunk_out.to(torch.float32)
             chunk_lse = chunk_lse.to(torch.float32)
-            out_list.append(chunk_out.reshape(num_tokens * H, D))
-            lse_list.append(chunk_lse.reshape(num_tokens * H))
+            if selection is not None:
+                previous_out, previous_lse = prefix_output, prefix_lse
+                if indices is not None:
+                    previous_out = prefix_output.index_select(0, indices)
+                    previous_lse = prefix_lse.index_select(0, indices)
+                merged_out, merged_lse = torch_npu.npu_attention_update(
+                    (previous_lse.reshape(-1), chunk_lse.reshape(-1)),
+                    (previous_out.reshape(-1, D), chunk_out.reshape(-1, D)),
+                    0,
+                )
+                if indices is None:
+                    prefix_output = merged_out.view(num_tokens, H, D)
+                    prefix_lse = merged_lse.view(num_tokens, H, 1)
+                else:
+                    prefix_output.index_copy_(0, indices, merged_out.view(-1, H, D))
+                    prefix_lse.index_copy_(0, indices, merged_lse.view(-1, H, 1))
+            else:
+                out_list.append(chunk_out.reshape(num_tokens * H, D))
+                lse_list.append(chunk_lse.reshape(num_tokens * H))
 
+        if selections is not None:
+            return prefix_output, prefix_lse
         output_final, _ = torch_npu.npu_attention_update(tuple(lse_list), tuple(out_list), 0)
         return output_final.view(num_tokens, H, D), None
 

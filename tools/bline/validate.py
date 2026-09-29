@@ -63,6 +63,10 @@ def plan(args):
     additional["bline_diagnostics"] = dict(
         enabled=True, max_steps=args.steps, max_bytes=args.max_bytes, max_events=2048, max_pages=256, max_requests=64
     )
+    if args.arm_file:
+        if not Path(args.arm_file).is_absolute():
+            raise ValueError("--arm-file must be an absolute path")
+        additional["bline_diagnostics"]["arm_file"] = args.arm_file
     extra = args.serve_args
     if extra and extra[0] == "--":
         extra = extra[1:]
@@ -241,6 +245,7 @@ def main():
     item.add_argument("--model", required=True)
     item.add_argument("--layers", type=int, default=4)
     item.add_argument("--trust-remote-code", action="store_true")
+    item.add_argument("--arm-file", help="Begin capture after this shared marker file appears")
     item.add_argument("--steps", type=int, default=8)
     item.add_argument("--max-bytes", type=int, default=268435456)
     item.add_argument("--additional-config", help="Existing JSON file, merged rather than discarded")

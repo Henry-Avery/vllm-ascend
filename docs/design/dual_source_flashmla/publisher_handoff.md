@@ -1,9 +1,13 @@
 # PR 15 发布机验证交接
 
 本轮优先验收 #15；#13 `93dbf8f91c0ca3d94e5617b0a1903b0456edc40a`
-保留为修复对照。VA 使用本次交付回报中的完整 SHA，配套 vLLM 固定为
+保留为仍有异常的对照。VA 使用本次交付回报中的完整 SHA，配套 vLLM 固定为
 `ced6857afa0ea7b2e3f0846a62e1394e90f15607`。不重合移动的上游 head，
 不只记录分支名。本文是待执行步骤；本地未运行 NPU、构建或服务。
+
+本次补齐混合历史 FIA、KDA 脏页复用测试与延迟取证，按
+[逐步验证清单](followup_validation.md)执行。此前短窗口说明仍适用于不设置
+`arm_file` 的运行；第七轮定位必须保留同一服务的前六轮状态。
 
 ## 1. 锁定实际运行来源
 
@@ -14,7 +18,7 @@ FLA wheel/native OPP、外部 FlashMLA wheel/OPP 的版本与文件 hash。
 
 ## 2. 先复现同一启动条件
 
-沿用原事故 dummy 5 层、eager、TP8/DP1、无 speculative 的完整命令；
+沿用最新 #13 失败回执的 dummy 5 层、eager、TP8/DP1、无 speculative 完整命令；
 MRV2 与 FlashMLA 开关开启。本文不补造未知模型路径或启动参数。
 在初始化日志/调试记录中保存真实 spec、planner descriptor 和最终 tensor：
 

@@ -79,7 +79,7 @@ class BLineDiagnostics:
     def __init__(self, config, *, rank, context, emit=None):
         if type(config.get("enabled", False)) is not bool:
             raise ValueError("bline_diagnostics.enabled must be a JSON boolean")
-        allowed = {"enabled", "max_steps", "max_bytes", "max_events", "max_pages", "max_requests"}
+        allowed = {"enabled", "max_steps", "max_bytes", "max_events", "max_pages", "max_requests", "arm_file"}
         if set(config) - allowed:
             raise ValueError(f"Unknown bline_diagnostics keys: {set(config) - allowed}")
         self.limits = {}
@@ -94,6 +94,11 @@ class BLineDiagnostics:
             if type(value) is not int or not 1 <= value <= ceiling:
                 raise ValueError(f"{key} must be an integer in [1, {ceiling}]")
             self.limits[key] = value
+        arm_file = config.get("arm_file")
+        if arm_file is not None and (not isinstance(arm_file, str) or not Path(arm_file).is_absolute()):
+            raise ValueError("arm_file must be an absolute path")
+        self.arm_file = Path(arm_file) if arm_file is not None else None
+        self.armed = self.arm_file is None
         self.rank = rank
         self.context = context
         self.emit_line = emit or (lambda line: logging.getLogger(__name__).warning("BLINE %s", line))
@@ -159,6 +164,11 @@ class BLineDiagnostics:
         self.active = False
         if dummy or not self.supported:
             return
+        if not self.armed:
+            if not self.arm_file.is_file():
+                return
+            self.armed = True
+            self.emit("TRACE", "armed", arm_file=str(self.arm_file))
         if self.step >= self.limits["max_steps"]:
             if not self.exhausted:
                 self.emit("UNCOVERED", "step_budget", remaining_bytes=self.remaining)
@@ -534,6 +544,7 @@ def install_bline_diagnostics(runner, context):
         mla_layers=list(probe.mla),
         layout=str(runner.cache_config.get_resolved_kv_cache_layout()),
         limits=probe.limits,
+        arm_file=str(probe.arm_file) if probe.arm_file else None,
         expected_ranks=parallel.tensor_parallel_size,
         diagnostic_path=str(Path(__file__).resolve()),
         diagnostic_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),

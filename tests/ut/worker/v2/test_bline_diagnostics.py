@@ -389,3 +389,40 @@ def test_publisher_cli_direct_execution_avoids_tools_bisect_shadow():
     )
     assert result.returncode == 0, result.stderr
     assert "manifest" in result.stdout and "summary" in result.stdout
+
+
+def test_delayed_arm_preserves_budget_and_same_cache_until_target_round(tmp_path):
+    marker = tmp_path / "round7.arm"
+    events = []
+    probe = bline.BLineDiagnostics(
+        {"arm_file": str(marker), "max_steps": 2},
+        rank=0,
+        context=lambda: None,
+        emit=lambda line: events.append(json.loads(line)),
+    )
+    initial_bytes = probe.remaining
+    for _ in range(500):
+        probe.begin(False)
+        probe.finite("raw_logits", torch.tensor([float("nan")]))
+        assert not probe.active
+    assert probe.step == 0 and probe.remaining == initial_bytes and not events
+    marker.touch()
+    probe.begin(True)  # warmup/idle must not arm or spend a step
+    assert not probe.armed
+    probe.begin(False)
+    assert probe.active and probe.step == 1
+    probe.finite("raw_logits", torch.tensor([float("nan")]))
+    assert any(e["check"] == "raw_logits" and e["status"] == "FAIL" for e in events)
+    marker.unlink()  # arming is latched for this run; never resets budgets
+    probe.begin(False)
+    assert probe.active and probe.step == 2
+    probe.begin(False)
+    assert not probe.active and probe.step == 2
+    assert sum(e["check"] == "armed" for e in events) == 1
+    assert events[-1]["check"] == "step_budget"
+
+
+@pytest.mark.parametrize("path", ["relative.arm", "", 12, False])
+def test_arm_path_must_be_absolute(path):
+    with pytest.raises(ValueError, match="absolute"):
+        bline.BLineDiagnostics({"arm_file": path}, rank=0, context=lambda: None)

@@ -666,3 +666,23 @@ def test_cow_same_pointer_distinct_views_copy_union_once_from_original_sources(a
     assert torch.all(larger[1] == 5) and torch.all(larger[3] == 3)
     changed = (backing != before).nonzero().flatten()
     assert torch.all(((changed >= 128) & (changed < 160)) | ((changed >= 256) & (changed < 288)))
+
+
+def test_state_copy_preserves_nonfinite_payload_bits_and_cold_gather_masks_them(api):
+    # Distinct NaN payload, infinity and signed zero must survive pure copies;
+    # the same reused row must be ignored entirely for a cold request.
+    backing, raw, (_, state) = _states(api)
+    bits = torch.tensor([0x7FC00001, 0x7FA00001, -2147483648, -8388608], dtype=torch.int32)
+    state[3].view(torch.int32).copy_(bits.view_as(state[3]))
+    before = backing.clone()
+    ids = torch.tensor([3])
+    gathered = api["gather_ssm_states"](state, ids, torch.tensor([True]))
+    assert torch.equal(gathered[0].view(torch.int32), bits.view_as(state[3]))
+    cold = api["gather_ssm_states"](state, ids, torch.tensor([False]))
+    assert torch.all(cold == 0) and torch.isfinite(cold).all()
+    api["scatter_ssm_states_"](state, torch.tensor([1]), gathered)
+    assert torch.equal(state[1].view(torch.int32), state[3].view(torch.int32))
+    allowed = torch.zeros_like(backing, dtype=torch.bool)
+    offset = state[1].data_ptr() - backing.data_ptr()
+    allowed[offset : offset + state[1].numel() * state.element_size()] = True
+    assert torch.all((backing == before) | allowed)
