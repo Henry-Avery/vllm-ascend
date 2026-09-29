@@ -20,6 +20,7 @@ def _gather_ssm_states_kernel(
     stride_state_batch: tl.int64,
     stride_indices,
     stride_has_initial_state,
+    num_state_rows,
     row_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -34,10 +35,11 @@ def _gather_ssm_states_kernel(
         mask=has_initial_state,
         other=0,
     ).to(tl.int64)
+    valid = has_initial_state & (state_idx >= 0) & (state_idx < num_state_rows)
 
     values = tl.load(
         state_ptr + state_idx * stride_state_batch + offsets,
-        mask=mask & has_initial_state,
+        mask=mask & valid,
         other=0.0,
     )
     tl.store(output_ptr + batch_idx * row_size + offsets, values, mask=mask)
@@ -51,6 +53,7 @@ def _scatter_ssm_states_kernel(
     stride_state_batch: tl.int64,
     stride_indices,
     stride_source_batch: tl.int64,
+    num_state_rows,
     row_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -60,14 +63,15 @@ def _scatter_ssm_states_kernel(
     mask = offsets < row_size
 
     state_idx = tl.load(indices_ptr + batch_idx * stride_indices).to(tl.int64)
+    valid = (state_idx >= 0) & (state_idx < num_state_rows)
     values = tl.load(
         source_ptr + batch_idx * stride_source_batch + offsets,
-        mask=mask,
+        mask=mask & valid,
     )
     tl.store(
         state_ptr + state_idx * stride_state_batch + offsets,
         values,
-        mask=mask,
+        mask=mask & valid,
     )
 
 
@@ -137,7 +141,8 @@ def gather_ssm_states(
     ``state`` has shape ``[num_state_rows, *inner_dims]``. The inner
     dimensions must be contiguous; only ``state.stride(0)`` may include
     physical page padding. ``indices`` select physical state rows and may be
-    unsorted or non-contiguous. Callers must provide valid row IDs. The
+    unsorted or non-contiguous. Negative or out-of-range IDs produce zero
+    rows without reading the cache. Row zero is a valid physical slot. The
     optional ``output_dtype`` only changes the gathered output dtype.
     """
     _validate_gather_inputs(state, indices, has_initial_state)
@@ -160,6 +165,7 @@ def gather_ssm_states(
         state.stride(0),
         indices.stride(0),
         has_initial_state.stride(0),
+        state.shape[0],
         row_size=row_size,
         BLOCK_SIZE=STATE_IO_BLOCK_SIZE,
         num_warps=8,
@@ -178,6 +184,8 @@ def scatter_ssm_states_(
     contiguous and padding is represented by ``state.stride(0)``. ``indices``
     select physical rows and may be unsorted or non-contiguous. ``source``
     must have the logical state shape and contiguous inner dimensions.
+    Negative or out-of-range IDs are skipped. Valid destination IDs must be
+    unique; parallel writes to a repeated destination are not serialized.
     """
     _validate_scatter_inputs(state, indices, source)
     if indices.numel() == 0:
@@ -192,6 +200,7 @@ def scatter_ssm_states_(
         state.stride(0),
         indices.stride(0),
         source.stride(0),
+        state.shape[0],
         row_size=row_size,
         BLOCK_SIZE=STATE_IO_BLOCK_SIZE,
         num_warps=8,

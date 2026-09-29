@@ -25,6 +25,7 @@ from vllm_ascend.compilation.updatable_graph import (
 )
 from vllm_ascend.utils import use_updatable_graph
 from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_sizes, model_capture_wrapper
+from vllm_ascend.worker.v2.attn_utils import flashmla_metadata_scope
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -71,7 +72,11 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture ACL graphs for DFlash."""
-        with communicator_switch(), model_capture_wrapper(self.speculator, False):
+        with (
+            communicator_switch(),
+            model_capture_wrapper(self.speculator, False),
+            flashmla_metadata_scope(attn_groups, getattr(self.speculator, "flashmla_executor", None)),
+        ):
             super().capture(
                 forward_fn,
                 input_buffers,

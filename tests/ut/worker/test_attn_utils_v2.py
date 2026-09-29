@@ -249,7 +249,7 @@ def test_v2_mla_single_raw_backing_selects_layout_by_hardware_and_local_q_heads(
     num_blocks = 2
     spec = AscendMLAAttentionSpec(
         block_size=384,
-        num_heads=64,
+        num_query_heads=64,
         num_kv_heads=1,
         head_size=576,
         dtype=torch.bfloat16,
@@ -325,7 +325,7 @@ def test_v2_mla_single_raw_backing_selects_layout_by_hardware_and_local_q_heads(
 
     monkeypatch.setattr(attn_utils, "get_current_hardware_profile", lambda: flash_profile)
     for q_heads in (8, 12, 64, 96):
-        spec = replace(spec, num_heads=q_heads)
+        spec = replace(spec, num_query_heads=q_heads)
         fused = reshape()
         assert isinstance(fused, torch.Tensor)
         assert fused.shape == (6, 128, 1, 576)
@@ -333,7 +333,7 @@ def test_v2_mla_single_raw_backing_selects_layout_by_hardware_and_local_q_heads(
 
     # Even on A5, FlashMLA-incompatible query-head counts use the
     # FIA-compatible component-major layout.
-    spec = replace(spec, num_heads=48)
+    spec = replace(spec, num_query_heads=48)
     a5_fallback = reshape()
     assert isinstance(a5_fallback, tuple)
 
@@ -1654,8 +1654,10 @@ def test_attn_state_mla_spec_and_metadata_wrappers(monkeypatch):
     specs = attn_utils.get_kv_cache_spec(vllm_config)
     assert set(specs) == {"fa", "sfa"}
     assert specs["fa"].head_size == 128
-    assert specs["fa"].num_heads == 64
-    assert specs["sfa"].num_heads == 64
+    assert specs["fa"].num_heads == specs["fa"].num_kv_heads == 1
+    assert specs["fa"].num_query_heads == 64
+    assert specs["sfa"].num_heads == specs["sfa"].num_kv_heads == 1
+    assert specs["sfa"].num_query_heads == 64
     assert specs["sfa"].cache_sparse_sfa_c8 is True
 
     mla_spec = AscendMLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)

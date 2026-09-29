@@ -26,10 +26,19 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # type: ignore
 from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.flashmla import (
+    FLASHMLA_QK_DIM,
+    FLASHMLA_QUERY_HEADS,
+    FLASHMLA_V_DIM,
+    split_flashmla_requests,
+)
+from vllm_ascend.attention.flashmla_metadata import FlashMLADecode, FlashMLAMetadataBuilder
+from vllm_ascend.attention.mla_context import HistoryQuerySelection, build_history_query_selections
 from vllm_ascend.attention.utils import (
     MLAPO_MAX_SUPPORTED_TOKENS,
     AscendCommonAttentionMetadata,
@@ -63,6 +72,7 @@ from vllm_ascend.utils import (
     maybe_trans_nz,
     weak_ref_tensors,
 )
+from vllm_ascend.worker.device_metadata import DeviceMetadataStage, wait_for_device_metadata
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 if TYPE_CHECKING:
@@ -153,6 +163,7 @@ class ChunkedContextMetadata:
     chunk_seq_lens: torch.Tensor
     chunk_seq_lens_npu: torch.Tensor
     chunk_actual_seq_lengths_kv_list: list[list[int]]
+    history_query_selections: list[HistoryQuerySelection] | None = None
 
 
 @dataclass
@@ -240,6 +251,7 @@ class AscendMLAMetadata:
     decode: AscendMLADecodeMetadata | None = None
     prefill: AscendMLAPrefillMetadata | None = None
     reshape_cache_event: torch.npu.Event = None
+    external_flashmla: FlashMLADecode | None = None
 
     def __post_init__(self):
         pass
@@ -333,6 +345,88 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         self.query_lens: torch.Tensor = None
         self.seq_lens: torch.Tensor = None
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+        self.flashmla_state = None
+        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            impl = static_forward_context[layer_names[0]].impl
+            self.flashmla_state = FlashMLAMetadataBuilder(impl, device, scheduler_config.max_num_seqs)
+
+    @property
+    def uses_device_metadata(self) -> bool:
+        return self.flashmla_state is not None
+
+    def enable_device_metadata(self) -> None:
+        if self.flashmla_state is not None:
+            self.flashmla_state.defer = True
+
+    def take_device_metadata_tasks(self):
+        return self.flashmla_state.take_tasks() if self.flashmla_state is not None else ()
+
+    def _build_external_flashmla(self, common_prefix_len, common, *, retain_for_graph: bool = False):
+        """Keep FIA prefill metadata, but build decode inputs from device state."""
+        state = self.flashmla_state
+        assert state is not None
+        state.tasks = ()
+        self.num_decodes, self.num_prefills, self.num_decode_tokens, self.num_prefill_tokens = split_flashmla_requests(
+            common
+        )
+        if retain_for_graph and self.num_prefills:
+            raise ValueError("FlashMLA full graph capture requires a decode-only batch")
+        self.set_num_actual_tokens(common)
+        self.block_table = common.block_table_tensor[: common.num_reqs]
+        self.slot_mapping = common.slot_mapping[: self.num_actual_tokens]
+        prefill = None
+        if self.num_prefills:
+            # FIA's existing history gather needs exact host prefill lengths.
+            # Do not discard these mirrors as the reference's all-Flash path does.
+            self.query_lens = (common.query_start_loc_cpu[1:] - common.query_start_loc_cpu[:-1])[: common.num_reqs]
+            self.seq_lens = common._seq_lens_cpu if common._seq_lens_cpu is not None else common.seq_lens_cpu
+            if self.seq_lens is None:
+                raise RuntimeError("FIA prefill requires the runner's CPU sequence lengths")
+            self.seq_lens = self.seq_lens[: common.num_reqs]
+            prefill = self.build_prefill_metadata(common_prefix_len, common)
+
+        flash = None
+        decode = None
+        decode_tokens = self.num_decode_tokens
+        if self.num_decodes:
+            flash = state.build(
+                common,
+                self.num_decodes,
+                decode_tokens,
+                self.num_prefills > 0,
+                retain_for_graph=retain_for_graph,
+            )
+            decode_tokens = flash.query.shape[0]
+            decode = self.decode_metadata_cls(
+                input_positions=flash.positions,
+                block_table=flash.block_table,
+                seq_lens=flash.cache_lens,
+                max_seq_lens=common.max_seq_len,
+                seq_lens_list=[],
+                actual_seq_lengths_q=None,
+                cos=flash.cos,
+                sin=flash.sin,
+            )
+            # Mixed eager batches retain the original prefill slot slice.
+            if not self.num_prefills:
+                self.slot_mapping = flash.slots
+        return self.metadata_cls(
+            num_actual_tokens=self.num_actual_tokens,
+            num_input_tokens=common.num_input_tokens,
+            num_decodes=self.num_decodes,
+            num_decode_tokens=decode_tokens,
+            num_prefills=self.num_prefills,
+            slot_mapping=self.slot_mapping,
+            query_start_loc=common.query_start_loc,
+            seq_lens=common.seq_lens,
+            seq_lens_cpu=common._seq_lens_cpu,
+            block_tables=common.block_table_tensor,
+            prefill=prefill,
+            decode=decode,
+            attn_state=common.attn_state,
+            causal=common.causal,
+            external_flashmla=flash,
+        )
 
     @staticmethod
     def determine_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
@@ -360,7 +454,10 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
 
         for i, req_id in enumerate(input_batch.req_ids):
             num_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            if num_tokens <= self.decode_threshold:
+            is_decode = num_tokens <= self.decode_threshold
+            if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+                is_decode = input_batch.num_computed_tokens_cpu[i] >= input_batch.num_prompt_tokens[i]
+            if is_decode:
                 decodes.append(i)
             else:
                 prefills.append(i)
@@ -473,14 +570,21 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         common_prefix_len: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
         fast_build: bool = False,
+        retain_for_graph: bool = False,
     ) -> AscendMLAMetadata:
+        if self.flashmla_state is not None:
+            return self._build_external_flashmla(
+                common_prefix_len, common_attn_metadata, retain_for_graph=retain_for_graph
+            )
         expanded_slot_mapping = common_attn_metadata.slot_mapping if self.pcp_enabled else None
         num_reqs = common_attn_metadata.num_reqs
         query_start_loc = common_attn_metadata.query_start_loc
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
 
-        self.num_decodes, self.num_prefills, self.num_decode_tokens, self.num_prefill_tokens = (
-            split_decodes_and_prefills(
+        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            counts = split_flashmla_requests(common_attn_metadata)
+        else:
+            counts = split_decodes_and_prefills(
                 common_attn_metadata,
                 decode_threshold=self.decode_threshold,
                 treat_short_extends_as_decodes=(
@@ -490,7 +594,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
                     or (self.dcp_enabled and is_pd_decode_recompute_scheduler_enabled(self.vllm_config))
                 ),
             )
-        )
+        self.num_decodes, self.num_prefills, self.num_decode_tokens, self.num_prefill_tokens = counts
         self.set_num_actual_tokens(common_attn_metadata)
         assert self.num_decodes + self.num_prefills == num_reqs
         assert self.num_decode_tokens + self.num_prefill_tokens == common_attn_metadata.num_actual_tokens
@@ -621,6 +725,13 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             chunk_seq_lens_npu=self.chunk_seq_lens.npu(),
             workspace=self.chunked_prefill_workspace,
             chunk_actual_seq_lengths_kv_list=chunk_actual_seq_lengths_kv_list,
+            history_query_selections=(
+                build_history_query_selections(
+                    self.query_lens[reqs_start:num_reqs].tolist(), self.chunk_seq_lens.tolist(), self.device
+                )
+                if envs.VLLM_ASCEND_ENABLE_FLASH_MLA and self.pcp_size == 1 and not enable_dcp()
+                else None
+            ),
         )
 
     def get_block_table_size(self, common_attn_metadata: AscendCommonAttentionMetadata, build_metadata_step: int):
@@ -766,8 +877,12 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         capture_metadata = copy(common_attn_metadata)
         if capture_metadata.attn_state is None:
             capture_metadata.attn_state = AscendAttentionState.ChunkedPrefill
-        if self.dcp_enabled and capture_metadata.is_prefilling is None:
+        if (self.dcp_enabled or envs.VLLM_ASCEND_ENABLE_FLASH_MLA) and capture_metadata.is_prefilling is None:
             capture_metadata.is_prefilling = torch.zeros(capture_metadata.num_reqs, dtype=torch.bool)
+        if self.flashmla_state is not None:
+            assert capture_metadata.num_reqs <= capture_metadata.num_actual_tokens * self.reorder_batch_threshold
+            assert capture_metadata.max_query_len <= self.reorder_batch_threshold
+            return self._build_external_flashmla(0, capture_metadata, retain_for_graph=True)
         return super().build_for_cudagraph_capture(capture_metadata)
 
     def build_for_graph_capture(
@@ -777,10 +892,15 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
     ):
         # TODO: Drop SpecDecoding after legacy V1/310P graph capture callers migrate.
         if attn_state in {AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding}:
-            attn_metadata = self.build(
-                common_prefix_len=0,
-                common_attn_metadata=common_attn_metadata,
-            )
+            if self.flashmla_state is not None:
+                common_attn_metadata = copy(common_attn_metadata)
+                common_attn_metadata.is_prefilling = torch.zeros(common_attn_metadata.num_reqs, dtype=torch.bool)
+                attn_metadata = self._build_external_flashmla(0, common_attn_metadata, retain_for_graph=True)
+            else:
+                attn_metadata = self.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common_attn_metadata,
+                )
         else:
             raise NotImplementedError(
                 "Currently we only support building dummy metadata for DecodeOnly and SpecDecoding state"
@@ -893,6 +1013,24 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.mlapo_num_heads = self.num_heads
         self.mlapo_weight_quant_mode = 3
         self._mlapo_uses_native_weights = False
+        self.external_flashmla_enabled = envs.VLLM_ASCEND_ENABLE_FLASH_MLA
+        if self.external_flashmla_enabled:
+            self._validate_external_flashmla()
+
+    def _validate_external_flashmla(self) -> None:
+        config = self.vllm_config
+        if not get_current_hardware_profile().supports(HardwareCapability.MLA_FLASH):
+            raise ValueError("External FlashMLA requires an Ascend MLA_FLASH-capable device")
+        if self.num_heads not in FLASHMLA_QUERY_HEADS or self.num_kv_heads != 1:
+            raise ValueError(f"External FlashMLA requires local Q heads in {FLASHMLA_QUERY_HEADS} and one KV head")
+        if self.kv_lora_rank != FLASHMLA_V_DIM or self.qk_rope_head_dim != FLASHMLA_QK_DIM - FLASHMLA_V_DIM:
+            raise ValueError("External FlashMLA requires latent512 + positional64 inputs")
+        if self.fa_quant_layer or self.dtype not in (torch.bfloat16, torch.float16) or self.enable_kv_nz:
+            raise ValueError("External FlashMLA integration requires unquantized BF16/FP16 BBND cache")
+        if self.pcp_enabled or config.parallel_config.decode_context_parallel_size != 1:
+            raise ValueError("External FlashMLA currently requires PCP=1 and DCP=1; distributed adaptation is separate")
+        if config.kv_transfer_config is not None:
+            raise ValueError("External FlashMLA with fused BBND cache requires colocated serving without KV transfer")
 
     @staticmethod
     def update_graph_params(
@@ -913,11 +1051,21 @@ class AscendMLAImpl(MLAAttentionImpl):
             # layers in the same metadata dict, but only MLA layers contribute a
             # captured FIA op, so zipping unfiltered keys against attn_params
             # pairs MLA params with KDA layer names.
-            attn_keys = [k for k in attn_metadata[0] if getattr(attn_metadata[0][k], "decode", None) is not None]
+            attn_keys = [
+                k
+                for k in attn_metadata[0]
+                if getattr(attn_metadata[0][k], "decode", None) is not None
+                and getattr(attn_metadata[0][k], "external_flashmla", None) is None
+            ]
         else:
             graph_params = get_graph_params()
             attn_metadata = forward_context.attn_metadata
-            attn_keys = [k for k in attn_metadata if getattr(attn_metadata[k], "decode", None) is not None]
+            attn_keys = [
+                k
+                for k in attn_metadata
+                if getattr(attn_metadata[k], "decode", None) is not None
+                and getattr(attn_metadata[k], "external_flashmla", None) is None
+            ]
         # FIXME: Behold! We are using a temporary hack here to update the args
         # for each layer's attention op in the graph.
         num_layers = len(attn_keys)
@@ -1275,7 +1423,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         lse_list = [prefix_lse.reshape(num_tokens * H)]
 
         if self.head_padding > 0:
-            query = torch.cat((q_nope, q_pe), dim=-1)
+            padded_query = torch.cat((q_nope, q_pe), dim=-1)
 
         common_kwargs = {
             "num_heads": self.num_heads,
@@ -1290,7 +1438,11 @@ class AscendMLAImpl(MLAAttentionImpl):
             "actual_seq_lengths": actual_seq_lengths_q,
         }
 
+        selections = getattr(prefill_metadata.chunked_context, "history_query_selections", None)
         for i in range(iters):
+            selection = selections[i] if selections is not None else None
+            if selection is not None and not selection.cu_query_lengths:
+                continue
             toks = prefill_metadata.chunked_context.seq_tot[i]
             context_seq_len_npu = self.get_context_seq_len_npu(i, attn_metadata)
             kv_c_normed = torch.empty(toks, num_heads, latent_kv_dim, dtype=cache_kv_c.dtype, device=cache_kv_c.device)
@@ -1336,6 +1488,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             common_kwargs["actual_seq_lengths_kv"] = actual_seq_lengths_kv
 
             if self.head_padding > 0:
+                query = padded_query
                 key = torch.cat((k_nope, k_pe), dim=-1)
             else:
                 # mla_nope_chunked_ctx: with qk_rope_head_dim == 0 the rope
@@ -1347,6 +1500,17 @@ class AscendMLAImpl(MLAAttentionImpl):
                 query = q_nope
                 key = k_nope
 
+            if selection is not None:
+                common_kwargs["actual_seq_lengths"] = selection.cu_query_lengths
+                common_kwargs["actual_seq_lengths_kv"] = selection.cu_kv_lengths
+                # The current segment has already initialized output/LSE for
+                # every query. Only merge rows with history in this chunk.
+                indices = selection.query_indices
+                if indices is not None:
+                    query = query.index_select(0, indices)
+                    if "query_rope" in common_kwargs:
+                        common_kwargs["query_rope"] = q_pe.index_select(0, indices)
+
             chunk_out, chunk_lse = torch_npu.npu_fused_infer_attention_score(
                 query, key.contiguous(), v.contiguous(), **common_kwargs
             )
@@ -1355,9 +1519,28 @@ class AscendMLAImpl(MLAAttentionImpl):
                 chunk_lse = chunk_lse.transpose(0, 1).unsqueeze(-1)
             chunk_out = chunk_out.to(torch.float32)
             chunk_lse = chunk_lse.to(torch.float32)
-            out_list.append(chunk_out.reshape(num_tokens * H, D))
-            lse_list.append(chunk_lse.reshape(num_tokens * H))
+            if selection is not None:
+                previous_out, previous_lse = prefix_output, prefix_lse
+                if indices is not None:
+                    previous_out = prefix_output.index_select(0, indices)
+                    previous_lse = prefix_lse.index_select(0, indices)
+                merged_out, merged_lse = torch_npu.npu_attention_update(
+                    (previous_lse.reshape(-1), chunk_lse.reshape(-1)),
+                    (previous_out.reshape(-1, D), chunk_out.reshape(-1, D)),
+                    1,
+                )
+                if indices is None:
+                    prefix_output = merged_out.view(num_tokens, H, D)
+                    prefix_lse = merged_lse.view(num_tokens, H, 1)
+                else:
+                    prefix_output.index_copy_(0, indices, merged_out.view(-1, H, D))
+                    prefix_lse.index_copy_(0, indices, merged_lse.view(-1, H, 1))
+            else:
+                out_list.append(chunk_out.reshape(num_tokens * H, D))
+                lse_list.append(chunk_lse.reshape(num_tokens * H))
 
+        if selections is not None:
+            return prefix_output, prefix_lse
         output_final, _ = torch_npu.npu_attention_update(tuple(lse_list), tuple(out_list), 0)
         return output_final.view(num_tokens, H, D), None
 
@@ -1548,6 +1731,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         *,
         attn_metadata: AscendMLAMetadata | None = None,
     ):
+        # DSpark context precomputation calls this writer without forward(),
+        # so it may receive the runner's fused Tensor rather than logical views.
+        if isinstance(kv_cache, torch.Tensor):
+            kv_cache = (kv_cache[..., : self.kv_lora_rank], kv_cache[..., self.kv_lora_rank :])
         if not self.use_mla_rope:
             return self._exec_kv_no_rope(kv_no_split, kv_cache, slots)
 
@@ -1886,6 +2073,31 @@ class AscendMLAImpl(MLAAttentionImpl):
             decode_q_pe = decode_q_pe[:, : self.num_heads]
         return decode_q_nope, decode_q_pe
 
+    def _forward_external_flashmla(self, preprocessed, fused_cache, metadata):
+        flash = metadata.external_flashmla
+        assert flash is not None
+        if not isinstance(fused_cache, torch.Tensor):
+            raise RuntimeError(
+                "External FlashMLA requires the original fused BBND cache; component-major tuples are invalid"
+            )
+        wait_for_device_metadata(DeviceMetadataStage.ATTENTION, id(flash.schedule))
+        flash.query[..., : self.kv_lora_rank].copy_(preprocessed.ql_nope)
+        flash.query[..., self.kv_lora_rank :].copy_(preprocessed.q_pe)
+        record_attention_compute_start()
+        latent, _ = flash.adapter.attention(
+            flash.query,
+            fused_cache,
+            block_table=flash.block_table,
+            cache_seqlens=flash.cache_lens,
+            cu_seqlens_q=flash.cu,
+            seqused_q=flash.used_q,
+            metadata=flash.schedule,
+            attn_mask=flash.attn_mask,
+        )
+        # Zero unused query rows even if the package leaves their output undefined.
+        latent.masked_fill_(~flash.token_live[None, :, None], 0)
+        return self._v_up_proj(latent)
+
     def mla_preprocess_only_decode(self, hidden_states, kv_cache, attn_metadata):
         bsz = attn_metadata.num_decode_tokens
         cache_index = attn_metadata.slot_mapping[:bsz].to(torch.int64)
@@ -2040,6 +2252,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             )
             decode_q_pe = (decode_q_pe / dequant_scale_q_nope.unsqueeze(-1) / self.fak_descale_float).to(torch.bfloat16)
         decode_slots = attn_metadata.slot_mapping[:num_decode_tokens:1]
+        if attn_metadata.external_flashmla is not None:
+            decode_slots = attn_metadata.external_flashmla.slots
         decode_kv_no_split = kv_no_split[:num_decode_tokens]
         return_current_kv = self._decode_requires_current_kv(attn_metadata)
         kv_result = self.exec_kv_decode(
@@ -2142,6 +2356,12 @@ class AscendMLAImpl(MLAAttentionImpl):
             # Profiling run.
             return output.fill_(0)
 
+        if attn_metadata.external_flashmla is not None:
+            # MRv1 must wait before the writer/rope consumes refreshed slots
+            # and positions, not only before the attention kernel. MRv2 waits
+            # outside capture in build_attn_metadata.
+            wait_for_device_metadata(DeviceMetadataStage.ATTENTION, id(attn_metadata.external_flashmla.schedule))
+
         num_actual_tokens = self.get_num_actual_tokens(attn_metadata)
         assert (
             attn_metadata.num_decodes is not None
@@ -2153,6 +2373,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         # Fused MLA cache由runner保存为单一tensor。旧MLA实现仍按
         # nope/rope两个logical tensor访问算子，因此在这里做零拷贝切片。
         fused_mla_cache = isinstance(kv_cache, torch.Tensor)
+        external_flash_cache = kv_cache if fused_mla_cache else None
         if isinstance(kv_cache, torch.Tensor):
             kv_cache = (
                 kv_cache[..., : self.kv_lora_rank],
@@ -2193,7 +2414,12 @@ class AscendMLAImpl(MLAAttentionImpl):
             )
         if decode_preprocess_res is not None:
             # MLA Preprocess for decoding
-            output_decode = self._forward_decode(decode_preprocess_res, kv_cache[0].shape[1], attn_metadata)
+            if attn_metadata.external_flashmla is not None:
+                output_decode = self._forward_external_flashmla(
+                    decode_preprocess_res, external_flash_cache, attn_metadata
+                )
+            else:
+                output_decode = self._forward_decode(decode_preprocess_res, kv_cache[0].shape[1], attn_metadata)
 
             o_proj_input[:num_decode_tokens] = output_decode
 
@@ -2210,7 +2436,6 @@ class AscendMLAImpl(MLAAttentionImpl):
                 kv_cache,
                 attn_metadata,
             )
-
             o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
         if gate is not None:
             o_proj_input.mul_(torch.sigmoid(gate))
