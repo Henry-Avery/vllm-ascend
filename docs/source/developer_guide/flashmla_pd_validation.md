@@ -1,9 +1,17 @@
 # FlashMLA 基础 PD 修补与验收
 
-本补丁基于 fork #16 `d4569fe213578d6c5eea8f8878f28bffc1446c0d`，
+本补丁已同步 fork #16 `5a466d655719813811ca9271e5885ffd50943c84`，
 配套 vLLM `ced6857afa0ea7b2e3f0846a62e1394e90f15607`。
 当前为 Draft：本地 CPU 回归可验证字节范围和控制流，真实权重 P→D、RDMA、NPU kernel 和性能尚未验收。
-其中，#16 的 DSpark profiling 修复保留；本轮用户选择先交付基础 PD，PD + DSpark 随后接入。
+其中，#16 的 DSpark profiling 修复和 RMSNorm 自定义算子回退均已继承。
+发布机在该 #16 提交上跑通了真实权重四机 graph + DSpark 混部；GPQA 仍有客户端补题记录，
+这不替代本分支的 PD 验收。本轮用户选择先交付基础 PD，PD + DSpark 随后接入。
+
+A5 的 `enable_custom_op()` 返回关闭时，公共 `AscendRMSNorm` 必须调用原生
+`torch_npu.npu_add_rms_norm` 并保留已加载的 bias，不能仍然调用不可用的 `AddRmsNormBias`。
+P/D 的 target 模型也经过该公共算子，因此即使本轮关闭 DSpark，仍需要继承这项修复。
+CPU 分支回归覆盖 FP32/BF16/FP16、bias 未分配/未加载/已加载、residual 有无及自定义算子开关；
+这些替身测试不证明真实 NPU kernel 数值。
 
 ## 原因和改动来源
 
@@ -47,6 +55,8 @@ python -m pytest --confcutdir=tests/ut/worker/v2 \
   tests/ut/worker/v2/test_hybrid_descriptor_layout.py \
   tests/ut/worker/v2/test_hybrid_state_page_layout.py \
   tests/ut/worker/v2/test_flashmla_phase_contract.py
+python -m pytest --confcutdir=tests/ut/ops \
+  tests/ut/ops/test_rmsnorm_fallback_contract.py
 ```
 
 这些测试执行生产函数及固定 ced6857 的 collector/aggregator/scheduler 源码片段；
