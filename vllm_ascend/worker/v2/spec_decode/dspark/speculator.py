@@ -31,13 +31,16 @@ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
     DSparkSpeculator,
 )
 
+from vllm_ascend import envs
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.worker.dcp_utils import DCPManager
+from vllm_ascend.worker.device_metadata import DeviceMetadataExecutor
 from vllm_ascend.worker.v2.aclgraph_utils import _get_graph_update_backend
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_metadata_factory,
     build_attn_metadata_wrapper,
+    flashmla_metadata_scope,
 )
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import prepare_replicated_pcp_config
 
@@ -50,6 +53,7 @@ class AscendDSparkSpeculator(DSparkSpeculator):
         super().__init__(vllm_config, device)
         self.input_batch: InputBatch | None = None
         self.attn_architecture: str | None = None
+        self.flashmla_executor = DeviceMetadataExecutor() if envs.VLLM_ASCEND_ENABLE_FLASH_MLA else None
         self._init_dcp()
 
     def _init_dcp(self) -> None:
@@ -244,6 +248,8 @@ class AscendDSparkSpeculator(DSparkSpeculator):
         """Match FULL-graph query lengths to the padded request count."""
         query_lens_list = [(i + 1) * self.num_query_per_req for i in range(num_reqs_padded)]
         for metadata in attn_metadata.values():
+            if getattr(metadata, "external_flashmla", None) is not None:
+                continue
             decode_metadata = metadata.decode if self.attn_architecture == "MLA" else metadata
             decode_metadata.actual_seq_lengths_q = query_lens_list
         return attn_metadata
@@ -277,7 +283,15 @@ class AscendDSparkSpeculator(DSparkSpeculator):
             # TODO: Remove this guard once main2main includes upstream vLLM
             # #54856 (facd9a74a1), which resets the profiling DP counts.
             sync_state = None
+        # Initial memory profiling invokes the drafter before set_attn creates
+        # its draft builders. Keep real runs bound to those builders.
+        attn_groups = getattr(self, "attn_groups", None)
+        if attn_groups is None:
+            if not (dummy_run and is_profile and skip_attn_for_dummy_run):
+                raise RuntimeError("DSpark attention groups are unavailable outside initial memory profiling")
+            attn_groups = ()
         with (
+            flashmla_metadata_scope(attn_groups, self.flashmla_executor),
             build_attn_metadata_wrapper(),
             build_attn_metadata_factory(
                 self.input_buffers.positions,

@@ -395,7 +395,11 @@ def test_prefill_fuses_raw_gate_and_updates_v_first_state(lower_bound):
     final_state = torch.randn(1, 1, 2, 2)
 
     with (
-        patch("vllm_ascend.ops.kimi_kda.clear_ssm_states"),
+        patch("vllm_ascend.ops.kimi_kda.gather_ssm_states", return_value=recurrent_state[state_indices].clone()),
+        patch(
+            "vllm_ascend.ops.kimi_kda.scatter_ssm_states_",
+            side_effect=lambda state, indices, source: state.index_copy_(0, indices.long(), source),
+        ),
         patch("vllm_ascend.ops.kda.l2norm_fwd", side_effect=lambda x: x),
         patch.object(
             torch.ops._C_ascend,

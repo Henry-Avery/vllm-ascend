@@ -36,7 +36,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence im
 )
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.kda import run_chunk_kda, run_recurrent_kda
-from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
+from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_ssm_states_
 from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
     AscendW4A8MXFPDynamicLinearMethod,
 )
@@ -491,8 +491,10 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
 
         # The recurrent cache uses [H,V,K]. The fused prefill operator accepts
         # that state layout directly through state_v_first.
-        initial_state_vk = recurrent_state[state_indices].contiguous()
-        clear_ssm_states(initial_state_vk, has_initial_state)
+        # CANN advanced indexing can normalize the entire strided shared
+        # pool. Read only live [H,V,K] payloads using their physical stride;
+        # false initial-state flags and invalid slots gather zero.
+        initial_state_vk = gather_ssm_states(recurrent_state, state_indices, has_initial_state)
 
         output, final_state = run_chunk_kda(
             q,
@@ -507,7 +509,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             self.dt_bias,
             lower_bound=self.gate_lower_bound,
         )
-        recurrent_state[state_indices] = final_state.to(recurrent_state.dtype)
+        scatter_ssm_states_(recurrent_state, state_indices, final_state)
         return output
 
     @eager_break_during_capture
