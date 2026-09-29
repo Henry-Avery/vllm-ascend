@@ -25,10 +25,33 @@ Kimi-K3 混合 MLA 与 KDA 状态。融合 MLA 的有效 payload 可能短于物
 跨 rank 汇总等待所有 rank 完成，调度器随后重算或报错。失败也 ACK，释放 P 保留页。
 这部分不能直接照搬 1 号，因为 1 号也没有接好该请求级失败接口。
 
-新握手携带协议版本、每层类型、组件 dtype、有效 shape/inner stride、块比例和 payload 长度。
+新握手携带协议版本、每层类型、cache group 编号、组件 dtype、有效 shape/inner stride、块比例和 payload 长度。
 两端都要使用本补丁。格式不匹配在提交 READ 前拒绝；不同物理容量/stride 本身不构成格式不匹配。
 上游 #16456 `4ef088d5` 的 component-major 放行不能直接替代 token-fused FlashMLA 的握手；
 上游 #14340 `51e68897` 的主线同步也不应整体覆盖 #16。
+
+## 与本地 1 号的逐项复核
+
+参考固定为本地 `va-k3-oldmain` 的 `de31c53`，未用远端同名方案替代。
+以下是当前代码关系，不能据此宣称完成设备验收。
+
+| 检查项 | 当前 #17 与 1 号的关系 |
+| --- | --- |
+| connector 注册 | `MooncakeConnectorV2` / `MooncakePullConnector` 注册入口已存在，与 1 号一致，无需重复注册 |
+| 单融合 view、payload/stride | 保留 1 号单 view 不合并规则；进一步限制多 view 的有效字节并集，寻址各用 P/D 自己的 stride |
+| 注册 backing、descriptor 与块比例 | 沿用配置驱动的 backing 注册；已有真实 planner/allocator 的 CPU 跨块拷贝与邻层保护回归 |
+| P 末 token 截断 | 已接入；比 1 号提前到 `on_new_request`，在本地 prefix 查询之前更新 prompt，防止旧长度命中计数 |
+| D 的 MLA/KDA 块映射 | 复用已有逻辑：MLA 展开 manager/kernel 块比例，KDA 取 P 的末状态页和 D 的目标状态页；首版 speculative 关闭 |
+| 传输失败和 P 页释放 | 补齐 1 号未接的请求级 `failed_recving`；跨 rank 完成后重算/报错，并 ACK 释放 P 保留页 |
+| cache group 编号一致性 | 本轮补齐：同名层 payload 一致但 P/D group 次序不同也必须在 READ 前拒绝 |
+| DSpark、异构 TP/CP、KVPP | 不整体移植 1 号的拓扑能力；基础 PD 首版仍明确拒绝这些组合 |
+
+本轮确认的遗漏在 `_validate_fused_mla_layout`：旧校验没有比较 `group_indices`，
+而 `_build_transfer_block_buckets` 用 D 的 group 编号同时索引两端请求的 block table。
+因此即使 dtype/shape/stride 全相同，P/D 分组次序不同仍可能读取另一组的块号。
+修补在握手阶段逐层核对 group 编号；不扩大首版支持范围，也不改变相同分组时的传输路径。
+新增 CPU 回归交换 MLA/KDA group 编号，旧代码接受，修补后在构建远端传输布局时拒绝。
+1 号也采用相同编号假设，所以这项不是照搬漏掉的代码，而是对现有假设补校验。
 
 ## 首版范围
 

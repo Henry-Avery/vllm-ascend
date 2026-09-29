@@ -275,6 +275,24 @@ def test_layout_mismatch_is_rejected_before_transfer(pd_api, bad):
     thread.executor.submit.assert_not_called()
 
 
+def test_layout_rejects_reordered_cache_groups_before_read(pd_api):
+    worker, _, _ = allocate_and_register(pd_api, "BLHNC", 3)
+    local = worker.transfer_metadata
+    thread, peer = make_peer(pd_api, local)
+    # Identical named layers and payloads, but P's request block-table groups
+    # are permuted. The transfer path indexes both tables with D's group ID.
+    assert set(local.group_indices) == {0, 1}
+    remote = dataclasses.replace(local, group_indices=[1 - group for group in local.group_indices])
+    peer.metadata_by_pp_rank = {0: remote}
+    thread.layer_names = local.layer_names
+    thread.spec_indices = [worker.layer_name_to_spec_index[name] for name in local.layer_names]
+    thread.kv_cache_specs = worker.kv_cache_specs
+    thread._get_layer_remote_tp_rank_groups = MagicMock(return_value=[[0]])
+    with pytest.raises(ValueError, match="group_indices"):
+        thread._build_remote_transfer_layout(peer)
+    thread._get_layer_remote_tp_rank_groups.assert_not_called()
+
+
 def test_layout_allows_different_capacity_and_physical_pitch(pd_api):
     _, _ = pd_api
     worker, _, _ = allocate_and_register(pd_api, "BLHNC", 3)

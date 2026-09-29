@@ -344,7 +344,15 @@ class MooncakePullRecvingThread(threading.Thread):
             remote_index = remote_indices.get(name)
             if remote_index is None:
                 continue  # The PP-union layer check below diagnoses missing layers.
-            for field_name in ("layer_layouts", "layer_block_sizes", "block_size_scales", "block_lens"):
+            # Request block tables are indexed by group ID on both ends. Equal
+            # payload layouts alone do not make permuted group tables safe.
+            for field_name in (
+                "group_indices",
+                "layer_layouts",
+                "layer_block_sizes",
+                "block_size_scales",
+                "block_lens",
+            ):
                 if getattr(local, field_name)[index] != getattr(pp_metadata, field_name)[remote_index]:
                     raise ValueError(f"Fused MLA PD incompatible {field_name} for layer {name!r}")
 
