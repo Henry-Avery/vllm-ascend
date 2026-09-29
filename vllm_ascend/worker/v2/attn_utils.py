@@ -17,6 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import math
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
@@ -27,6 +28,7 @@ import torch
 import vllm
 from vllm.config import ParallelConfig, VllmConfig, get_current_vllm_config, get_layers_from_vllm_config
 from vllm.distributed import get_dcp_group
+from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
@@ -36,6 +38,7 @@ from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
@@ -209,7 +212,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             continue
 
         kv_cache_spec[layer_name] = spec
-        if isinstance(spec, AttentionSpec):
+        if isinstance(spec, AttentionSpec) and getattr(attn_module, "align_kv_cache_with_mamba", True):
             attention_layer_names.append(layer_name)
             continue
 
@@ -259,14 +262,20 @@ def build_attn_metadata(
     causal: bool | Mapping[int, bool] = True,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
-    # TODO(Ronald1995): optimize AscendCommonAttentionMetadata.
-    # seq_lens_np is used for ascend npus, it maybe None in spec_decode case,
-    # we fill it with max_seq_len in case `attn_metadata_builder.build` raise
-    # an error.
     if seq_lens_np is None:
-        seq_lens_np = np.full(num_reqs, max_seq_len, dtype=np.int32)
+        if seq_lens_cpu_upper_bound is not None:
+            # FIA needs a CPU-side seq_lens upper bound for each request when
+            # speculative decoding does not provide exact CPU sequence lengths.
+            seq_lens_np = seq_lens_cpu_upper_bound[:num_reqs].numpy()
+        else:
+            # The batch maximum is a looser bound and can further reduce
+            # FIA accuracy by overstating individual KV sequence lengths.
+            seq_lens_np = np.full(num_reqs, max_seq_len, dtype=np.int32)
+
     seq_lens_cpu = torch.from_numpy(seq_lens_np)[:num_reqs]
     if seq_lens_cpu_upper_bound is None:
+        # seq_lens_cpu is already an upper bound (possibly exact), so reuse it
+        # when no separate CPU upper bound was supplied.
         seq_lens_cpu_upper_bound = seq_lens_cpu
 
     # Upstream prepares device-local lengths before building attention metadata.
@@ -418,19 +427,8 @@ def build_attn_state(
     # but only one token is not hit in cache.
     elif np.all(num_scheduled_tokens == 1):
         attn_state = AscendAttentionState.DecodeOnly
-        if vllm_config.speculative_config and vllm_config.speculative_config.method == "mtp":
-            # SpecDecoding now supports seq_len=1 and seq_len=2
-            # In Prefilling Decoding Disaggregation scenario, SpecDecoding
-            # need to supports seq_len=1
-            attn_state = AscendAttentionState.SpecDecoding
-    # Speculative decoding.
-    elif np.all(num_valid_tokens == 1):
-        if vllm_config.speculative_config and vllm_config.speculative_config.method == "mtp":
-            attn_state = AscendAttentionState.SpecDecoding
-        else:
-            attn_state = AscendAttentionState.ChunkedPrefill
-    # splitfuse
-    elif vllm_config.scheduler_config.enable_chunked_prefill:
+    # Speculative decoding or splitfuse.
+    elif np.all(num_valid_tokens == 1) or vllm_config.scheduler_config.enable_chunked_prefill:
         attn_state = AscendAttentionState.ChunkedPrefill
     else:
         attn_state = AscendAttentionState.PrefillCacheHit
@@ -498,6 +496,41 @@ def _adjust_dsv4_kv_layout(
         )
         offset_bytes += stride[0] * dtype_size
     return caches
+
+
+def _reshape_combined_attention_kv_cache(
+    raw_cache: torch.Tensor,
+    kv_cache_shape: tuple[int, ...],
+    dtype: torch.dtype,
+    page_stride_bytes: int,
+    num_blocks_per_kv_block: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Create block-strided K/V views over padded physical pages."""
+    if len(kv_cache_shape) != 5 or kv_cache_shape[0] != 2:
+        raise ValueError("Combined Attention cache must have shape [K/V, blocks, block_size, heads, dim].")
+    dtype_size = get_dtype_size(dtype)
+    if page_stride_bytes % dtype_size:
+        raise ValueError("Physical Attention page is not aligned to its dtype.")
+
+    hidden_size = math.prod(kv_cache_shape[2:])
+    if num_blocks_per_kv_block != 1:
+        # Match MRV1: interleave K/V per kernel block inside an unpadded page.
+        # A padded page cannot be flattened to kernel blocks with one stride.
+        kernel_page_bytes = 2 * hidden_size * dtype_size
+        if page_stride_bytes != num_blocks_per_kv_block * kernel_page_bytes:
+            raise ValueError("Padded combined Attention pages do not support kernel block splitting.")
+        page_stride_bytes = kernel_page_bytes
+    dense_strides = [math.prod(kv_cache_shape[dim + 1 :]) for dim in range(len(kv_cache_shape))]
+    combined_cache = torch.as_strided(
+        raw_cache.view(dtype),
+        size=kv_cache_shape,
+        stride=(
+            hidden_size,
+            page_stride_bytes // dtype_size,
+            *dense_strides[2:],
+        ),
+    )
+    return combined_cache[0], combined_cache[1]
 
 
 def _view_dsv4_cache(
@@ -675,15 +708,15 @@ def _allocate_kv_cache(
     Initialize the KV cache buffer with the correct size. The buffer needs to be
     reshaped to the desired shape before being used by the models.
 
-    NOTE: To support prefill disaggregation, we need to split kvcache tensor
-    into k_cache and v_cache, and the addr of both are aligned by 2M.
+    FullAttention caches use a combined allocation for block-strided K/V
+    views. Specialized caches keep their existing allocation layouts.
+    KV transfer aligns each raw allocation to 2 MiB.
 
     Args:
         kv_cache_config: The KV cache config
         device: The device
     Returns:
-        dict[str, tuple[torch.Tensor, torch.Tensor]]: A map between layer names
-            to their corresponding memory buffer for K cache and V cache
+        Raw cache tensors or K/V tensor pairs, indexed by layer name.
     """
     vllm_config = get_current_vllm_config()
     if KVPPConfig.from_vllm_config(vllm_config).size > 1:
@@ -704,6 +737,7 @@ def _allocate_kv_cache(
     has_mamba = any(isinstance(spec, MambaSpec) for spec in layer_kv_cache_spec.values())
     has_attention = any(isinstance(spec, AttentionSpec) for spec in layer_kv_cache_spec.values())
     use_hybrid_layout = has_mamba and has_attention
+    is_glm5_next = any(getattr(spec, "model_version", None) == "glm5_next" for spec in layer_kv_cache_spec.values())
 
     # The restored DeepSeek-V4 planner on main computes capacity for one
     # shared-tuple backing and emits every KVCacheTensor as a view into it.
@@ -750,7 +784,7 @@ def _allocate_kv_cache(
     # once here; allocating tensor.size for every descriptor duplicates the
     # full cache pool and can OOM before the second tensor is initialized.
     hybrid_backing: torch.Tensor | None = None
-    if use_hybrid_layout and not is_dsv4_model:
+    if use_hybrid_layout and not is_dsv4_model and not is_glm5_next:
         tensor_sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
         if len(tensor_sizes) != 1:
             raise ValueError("Hybrid KV cache tensors must share one backing allocation.")
@@ -923,6 +957,10 @@ def _allocate_kv_cache(
             k_size = kv_cache_tensor_size
             for layer_name in shared_names:
                 kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(k_size, alignment, device)
+        elif type(example_spec) is FullAttentionSpec and not enable_sfa(vllm_config):
+            for layer_name in shared_names:
+                layer_size = kv_cache_config.num_blocks * layer_kv_cache_spec[layer_name].page_size_bytes
+                kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(layer_size, alignment, device)
         else:
             k_dim, v_dim = _get_attention_kv_cache_dims(example_layer_name, example_spec)
             if enable_fa_quant(vllm_config):
@@ -1012,30 +1050,20 @@ def _reshape_mamba_kv_cache(
     raw_cache: torch.Tensor,
     kv_cache_spec: MambaSpec,
 ) -> list[torch.Tensor]:
-    """Create the contiguous per-state views used by the Ascend v1 runner."""
-    page_size_bytes = kv_cache_spec.page_size_bytes
-    assert raw_cache.numel() % page_size_bytes == 0
-    num_blocks = raw_cache.numel() // page_size_bytes
-
-    state_tensors: list[torch.Tensor] = []
-    start_idx = 0
-    # Keep the same hybrid storage layout as model_runner_v1:
-    #
-    # tensor1: [(kv_padding), conv, ...]
-    # tensor2: [k,            ssm,  ...]
-    # tensor3: [v,            (mamba_padding), ...]
-    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-        target_shape = (num_blocks, *shape)
-        end_idx = start_idx + torch.empty(
-            target_shape,
-            device="meta",
-        ).numel() * get_dtype_size(dtype)
-        state = raw_cache[start_idx:end_idx].view(dtype).view(target_shape)
-        state_tensors.append(state)
-        start_idx = end_idx
-
-    assert start_idx <= raw_cache.numel()
-    return state_tensors
+    """Create logical state views over padded physical hybrid pages."""
+    physical_page_size = (
+        kv_cache_spec.page_size_padded if kv_cache_spec.page_size_padded is not None else kv_cache_spec.page_size_bytes
+    )
+    if raw_cache.numel() % physical_page_size:
+        raise ValueError("Mamba cache allocation is not a whole number of physical pages.")
+    num_blocks = raw_cache.numel() // physical_page_size
+    cache_shapes = [(num_blocks, *shape) for shape in kv_cache_spec.shapes]
+    return _adjust_dsv4_kv_layout(
+        raw_cache,
+        cache_shapes,
+        list(kv_cache_spec.dtypes),
+        physical_page_size,
+    )
 
 
 def _reshape_kv_cache_v2(
@@ -1158,19 +1186,30 @@ def _reshape_kv_cache_v2(
                 if not isinstance(raw_cache, torch.Tensor):
                     raise ValueError(f"KPool tail cache for {layer_name} must use one raw tensor.")
                 typed_slot = raw_cache.view(kv_cache_spec.dtype)
-                tail_block_el = kv_cache_spec.unpadded_page_size_bytes // get_dtype_size(kv_cache_spec.dtype)
-                num_tail_blocks = kv_cache_config.num_blocks
-                if num_tail_blocks * tail_block_el * 2 > typed_slot.numel():
+                dtype_size = get_dtype_size(kv_cache_spec.dtype)
+                num_blocks = kv_cache_config.num_blocks
+                page_el = typed_slot.numel() // num_blocks if num_blocks else 0
+                tail_block_el = kv_cache_spec.unpadded_page_size_bytes // dtype_size
+                if num_blocks and tail_block_el > page_el:
                     raise ValueError(
-                        f"KPool tail cache for {layer_name} exceeds half the small slot: "
-                        f"packed={num_tail_blocks * tail_block_el} elements, slot={typed_slot.numel()}."
+                        f"KPool tail cache for {layer_name} does not fit one small page: "
+                        f"tail={tail_block_el} elements, page={page_el} elements."
                     )
                 kv_caches[layer_name] = [
-                    typed_slot[typed_slot.numel() - num_tail_blocks * tail_block_el :].view(
-                        num_tail_blocks,
-                        2,
-                        kv_cache_spec.block_size,
-                        kv_cache_spec.head_size,
+                    torch.as_strided(
+                        typed_slot,
+                        size=(
+                            num_blocks,
+                            2,
+                            kv_cache_spec.block_size,
+                            kv_cache_spec.head_size,
+                        ),
+                        stride=(
+                            page_el,
+                            kv_cache_spec.block_size * kv_cache_spec.head_size,
+                            kv_cache_spec.head_size,
+                            1,
+                        ),
                     )
                 ]
                 continue
@@ -1192,6 +1231,17 @@ def _reshape_kv_cache_v2(
                 if mamba_cache[0].shape[0] < kv_cache_config.num_blocks:
                     raise ValueError(f"Mamba cache for {layer_name} has fewer blocks than KVCacheManager.")
                 kv_caches[layer_name] = mamba_cache
+                logger.debug(
+                    "[non-contiguous-kv-cache][mrv2] mamba layer=%s "
+                    "logical_page=%s physical_page=%s shapes=%s strides=%s "
+                    "contiguous=%s",
+                    layer_name,
+                    kv_cache_spec.page_size_bytes,
+                    kv_cache_spec.page_size_padded,
+                    [tuple(tensor.shape) for tensor in mamba_cache],
+                    [tensor.stride() for tensor in mamba_cache],
+                    [tensor.is_contiguous() for tensor in mamba_cache],
+                )
                 continue
 
             single_raw_mla_cache = get_single_raw_mla_backing(raw_cache)
@@ -1248,13 +1298,20 @@ def _reshape_kv_cache_v2(
             if isinstance(raw_cache, tuple):
                 raw_k_tensor, raw_v_tensor = raw_cache
                 total_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
+                page_stride_bytes = kv_cache_spec.page_size_bytes
             else:
-                # Attention and Mamba share one aligned raw allocation.
+                # Attention and Mamba use independent logical views over one
+                # physical padded-page geometry.
                 total_bytes = raw_cache.numel()
+                page_stride_bytes = (
+                    kv_cache_spec.page_size_padded
+                    if kv_cache_spec.page_size_padded is not None
+                    else kv_cache_spec.page_size_bytes
+                )
 
-            if total_bytes % kv_cache_spec.page_size_bytes:
+            if total_bytes % page_stride_bytes:
                 raise ValueError(f"KV cache for {layer_name} is not a whole number of pages.")
-            num_blocks = total_bytes // kv_cache_spec.page_size_bytes
+            num_blocks = total_bytes // page_stride_bytes
             num_blocks_per_kv_block = get_storage_block_size(kv_cache_spec) // kernel_block_size
             kernel_num_blocks = num_blocks * num_blocks_per_kv_block
             kv_cache_shape = group.backend.get_kv_cache_shape(
@@ -1276,9 +1333,9 @@ def _reshape_kv_cache_v2(
                 for dim_idx in range(len(shape) - 2, -1, -1):
                     strides[dim_idx] = strides[dim_idx + 1] * shape[dim_idx + 1]
                 typed_slot = raw_single.view(kv_cache_spec.dtype)
-                if strides[0] * shape[0] * 2 > typed_slot.numel():
+                if strides[0] * shape[0] != typed_slot.numel():
                     raise ValueError(
-                        f"Compressed indexer cache for {layer_name} exceeds half the small slot: "
+                        f"Compressed indexer cache for {layer_name} does not exactly fill the small slot: "
                         f"packed={strides[0] * shape[0]} elements, slot={typed_slot.numel()}."
                     )
                 cache = torch.as_strided(typed_slot, size=shape, stride=tuple(strides))
@@ -1300,7 +1357,11 @@ def _reshape_kv_cache_v2(
                 )
 
             k_dtype = v_dtype = kv_cache_spec.dtype
-            if enable_fa_quant(vllm_config):
+            if (
+                isinstance(kv_cache_spec, AscendMLAAttentionSpec)
+                and not enable_sfa(vllm_config)
+                and enable_fa_quant(vllm_config)
+            ):
                 k_dtype, v_dtype = vllm_config.quant_config.get_kv_quant_dtype(
                     layer_name,
                     kv_cache_spec.dtype,
@@ -1318,16 +1379,37 @@ def _reshape_kv_cache_v2(
                 v_cache = raw_v_tensor.view(v_dtype).view(v_shape)
                 kv_caches[layer_name] = (k_cache, v_cache)
             else:
-                # Keep Attention K/V contiguous across the tail of the hybrid
-                # allocation, matching the model_runner_v1 storage contract.
-                k_size = torch.empty(k_shape, device="meta").numel() * get_dtype_size(k_dtype)
-                v_size = torch.empty(v_shape, device="meta").numel() * get_dtype_size(v_dtype)
-                kv_start = raw_cache.numel() - k_size - v_size
-                if kv_start < 0:
-                    raise ValueError(f"Attention cache views exceed the allocation for {layer_name}.")
-                k_cache = raw_cache[kv_start : kv_start + k_size].view(k_dtype).view(k_shape)
-                v_cache = raw_cache[kv_start + k_size :].view(v_dtype).view(v_shape)
+                if k_dtype != v_dtype:
+                    raise ValueError("Combined hybrid K/V cache requires matching K/V dtypes.")
+                if isinstance(kv_cache_spec, (AscendMLAAttentionSpec, MLAAttentionSpec)):
+                    # MLA backends return a 4D latent cache shape. Keep its K
+                    # and V components in contiguous regions, as in MRv1.
+                    typed_cache = raw_cache.view(k_dtype)
+                    k_elements = math.prod(k_shape)
+                    v_elements = math.prod(v_shape)
+                    if k_elements + v_elements > typed_cache.numel():
+                        raise ValueError(f"Combined MLA cache for {layer_name} is too small.")
+                    padding_elements = typed_cache.numel() - k_elements - v_elements
+                    k_cache = typed_cache[padding_elements : padding_elements + k_elements].view(k_shape)
+                    v_cache = typed_cache[padding_elements + k_elements :].view(v_shape)
+                else:
+                    k_cache, v_cache = _reshape_combined_attention_kv_cache(
+                        raw_cache,
+                        kv_cache_shape,
+                        k_dtype,
+                        page_stride_bytes,
+                        num_blocks_per_kv_block,
+                    )
                 kv_caches[layer_name] = (k_cache, v_cache)
+                logger.debug(
+                    "[non-contiguous-kv-cache][mrv2] attention layer=%s "
+                    "shape=%s stride=%s k_contiguous=%s v_contiguous=%s",
+                    layer_name,
+                    tuple(kv_cache_shape),
+                    (k_cache.stride(), v_cache.stride()),
+                    k_cache.is_contiguous(),
+                    v_cache.is_contiguous(),
+                )
 
     for layer_name, target_layer_name in shared_kv_cache_layers.items():
         kv_caches[layer_name] = kv_caches[target_layer_name]
@@ -1349,7 +1431,7 @@ def build_attn_metadata_wrapper():
 
 
 @contextmanager
-def build_draft_attn_metadata_factory(
+def build_attn_metadata_factory(
     positions, pad, is_prefilling, seq_lens_cpu=None, *, attn_state=None, parallel_config=None
 ):
     """Wrap build_attn_metadata with Ascend draft-model context.
