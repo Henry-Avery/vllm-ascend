@@ -47,6 +47,44 @@ def compare_case(case, args):
     return {"name": case["name"], "max_logprob_error": error, "baseline": baseline, "pd": pd}
 
 
+def run_cases(cases, args):
+    """Persist the full request ledger, including every failure and pending case."""
+    jobs = [
+        {"case_id": f"{index}:repeat-{repeat}", "name": case["name"], "status": "pending"}
+        for repeat in range(args.repeat)
+        for index, case in enumerate(cases)
+    ]
+    report = {"config": vars(args), "expected_cases": len(jobs), "cases": jobs}
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+
+    def save():
+        report["completed_cases"] = sum(job["status"] != "pending" for job in jobs)
+        report["passed_cases"] = sum(job["status"] == "passed" for job in jobs)
+        report["failed_cases"] = sum(job["status"] == "failed" for job in jobs)
+        # Atomic replacement keeps the previous complete JSON readable on interruption.
+        temporary = args.output.with_name(args.output.name + ".tmp")
+        temporary.write_text(json.dumps(report, default=str, indent=2))
+        temporary.replace(args.output)
+
+    save()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+            futures = {
+                executor.submit(compare_case, cases[index % len(cases)], args): job for index, job in enumerate(jobs)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                job = futures[future]
+                try:
+                    job["result"] = future.result()
+                    job["status"] = "passed"
+                except Exception as exc:
+                    job.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+                save()
+    finally:
+        save()
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", required=True, help="Already running colocated server URL")
@@ -64,16 +102,14 @@ def main():
     cases = json.loads(args.cases.read_text())
     if not cases or not all(isinstance(case.get("name"), str) and case.get("prompt") for case in cases):
         parser.error("Provide nonempty named prompt cases")
-    results = []
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-            futures = [executor.submit(compare_case, case, args) for _ in range(args.repeat) for case in cases]
-            for future in concurrent.futures.as_completed(futures):
-                results.append(future.result())
-    finally:
-        args.output.write_text(json.dumps({"config": vars(args), "completed_cases": results}, default=str, indent=2))
-    print(f"Compared {len(results)} cases; separately verify logs show real remote READs, not local recomputation.")
+    report = run_cases(cases, args)
+    print(
+        f"Expected {report['expected_cases']}, completed {report['completed_cases']}, "
+        f"passed {report['passed_cases']}, failed {report['failed_cases']}. "
+        "Separately verify real remote READs in server logs."
+    )
+    if report["passed_cases"] != report["expected_cases"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

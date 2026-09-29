@@ -89,7 +89,10 @@ python tests/e2e/manual/flashmla_pd_correctness.py \
 ```
 
 该工具只访问已启动的 API，比较生成 token、finish reason 和逐 token logprob；不会启动服务。
-数值容差先由参考端重复运行确定，再固定。输出一致仍须结合传输日志排除 D 全量本地重算。
+数值容差先由参考端重复运行确定，再固定。报告在请求发出前列出全部 case/repeat 编号，
+逐条落盘成功、失败和未完成状态；单条失败不会停止其他结果的收集，失败或缺项时退出码非零。
+先核对 expected/completed/passed/failed 数量，不能把部分成功或健康检查当成全量验收。
+输出一致仍须结合传输日志排除 D 全量本地重算。
 补充 NPU 接收快照和邻层/邻页/padding guard；注入 READ 超时、单 rank 失败、取消和布局不匹配，
 验证 D 重算/报错、不会使用部分状态，P ACK/超时回收不泄漏，也不会在 READ 未结束时提前释放。
 最后开启 graph 与 eager 对照，记录完整质量评测和 TTFT/TPOT/吞吐；这些完成前不要转为已验收。
