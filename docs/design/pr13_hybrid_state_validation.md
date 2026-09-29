@@ -1,5 +1,10 @@
 # PR 13 hybrid state cache alignment and validation
 
+This sheet records the `b4af8712` revision. The subsequent
+[query-head and descriptor startup correction](pr13_descriptor_startup_fix.md)
+supersedes its allocator coverage and incomplete plan-1 comparison. Its
+runtime limits and earlier state-consumer evidence remain relevant.
+
 Candidate parent: `3c3cca019c889d42d43e22f2c671edf5b7c8a720`.
 Paired vLLM: `ced6857afa0ea7b2e3f0846a62e1394e90f15607`.
 Plan-1 comparison: `de31c53dc5b94ff246b17aa198404a082162c2f9`.
