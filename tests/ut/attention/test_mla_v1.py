@@ -30,6 +30,35 @@ from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8Dyna
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ
 
 
+@pytest.mark.parametrize("device_type", [AscendDeviceType.A3, AscendDeviceType.A5])
+@pytest.mark.parametrize("num_heads", [8, 12, 64, 96, 16])
+def test_external_flashmla_uses_a5_layout_capability(device_type, num_heads):
+    impl = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1), kv_transfer_config=None
+        ),
+        num_heads=num_heads,
+        num_kv_heads=1,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        fa_quant_layer=False,
+        dtype=torch.bfloat16,
+        enable_kv_nz=False,
+        pcp_enabled=False,
+    )
+    with patch(
+        "vllm_ascend.attention.mla_v1.get_current_hardware_profile", return_value=get_hardware_profile(device_type)
+    ):
+        if device_type == AscendDeviceType.A3:
+            with pytest.raises(ValueError, match="MLA_FLASH-capable"):
+                AscendMLAImpl._validate_external_flashmla(impl)
+        elif num_heads == 16:
+            with pytest.raises(ValueError, match="local Q heads"):
+                AscendMLAImpl._validate_external_flashmla(impl)
+        else:
+            AscendMLAImpl._validate_external_flashmla(impl)
+
+
 @pytest.mark.parametrize("num_tokens", [1, 3])
 @pytest.mark.parametrize(
     "num_heads,kv_lora_rank",
@@ -1755,6 +1784,7 @@ class TestAscendMLAImpl(TestBase):
         hidden_states = torch.randn(2, 10, 768)
         kv_cache = [torch.randn(10, 1, 1, 768), torch.randn(10, 1, 1, 768)]
         attn_metadata = MagicMock()
+        attn_metadata.external_flashmla = None
 
         with self.assertRaises(NotImplementedError) as ctx:
             self.impl.forward_mha(layer_name, hidden_states, kv_cache, attn_metadata)
@@ -1768,6 +1798,7 @@ class TestAscendMLAImpl(TestBase):
         hidden_states = torch.randn(2, 10, 768)
         kv_cache = [torch.randn(10, 1, 1, 768), torch.randn(10, 1, 1, 768)]
         attn_metadata = MagicMock()
+        attn_metadata.external_flashmla = None
 
         with self.assertRaises(NotImplementedError) as ctx:
             self.impl.forward_mqa(layer_name, hidden_states, kv_cache, attn_metadata)
@@ -1810,6 +1841,7 @@ class TestAscendMLAImpl(TestBase):
         mock_update_stream = MagicMock()
         mock_forward_context = MagicMock()
         mock_attn_metadata = MagicMock()
+        mock_attn_metadata.external_flashmla = None
         mock_forward_context.attn_metadata = {"layer_0": mock_attn_metadata}
         mock_attn_metadata.decode.seq_lens_list = [10, 20, 30]
         mock_attn_metadata.decode.actual_seq_lengths_q = [10, 20, 30]
@@ -1897,6 +1929,7 @@ class TestAscendMLAImpl(TestBase):
         mock_forward_context = MagicMock()
 
         mock_attn_metadata = MagicMock()
+        mock_attn_metadata.external_flashmla = None
         mock_attn_metadata.decode = MagicMock()
         mock_attn_metadata.decode.seq_lens_list = [10, 20, 30]
         mock_attn_metadata.decode.actual_seq_lengths_q = [10, 20, 30]
@@ -1953,6 +1986,7 @@ class TestAscendMLAImpl(TestBase):
 
     def test_get_context_seq_len_npu(self):
         mock_attn_metadata = MagicMock()
+        mock_attn_metadata.external_flashmla = None
         mock_prefill_metadata = MagicMock()
         mock_chunked_context = MagicMock()
         mock_chunked_context.chunk_seq_lens_npu = torch.tensor([10, 20, 30])
@@ -2086,6 +2120,7 @@ class TestAscendMLAImpl(TestBase):
         kv_c_and_k_pe_cache = [torch.randn(10, 1, 1, 192), torch.randn(10, 1, 1, 32)]
 
         attn_metadata = MagicMock()
+        attn_metadata.external_flashmla = None
         prefill_metadata = MagicMock()
         prefill_metadata.actual_seq_lengths_q = [10, 20]
         prefill_metadata.attn_mask = torch.randn(1, 1, 20, 20)
@@ -2172,6 +2207,7 @@ class TestAscendMLAImpl(TestBase):
         kv_c_and_k_pe_cache = [torch.randn(10, 1, 1, 192), torch.randn(10, 1, 1, 32)]
 
         attn_metadata = MagicMock()
+        attn_metadata.external_flashmla = None
         prefill_metadata = MagicMock()
         prefill_metadata.actual_seq_lengths_q = [10, 20]
         prefill_metadata.attn_mask = torch.randn(1, 1, 20, 20)
@@ -2754,7 +2790,9 @@ class TestAscendMLAImpl(TestBase):
         self.impl._forward_decode = MagicMock(return_value=torch.ones(2, 2))
         self.impl.o_proj = MagicMock(side_effect=lambda x, **_kwargs: (x,))
         hidden, output = torch.zeros(2, 4), torch.empty(2, 2)
-        metadata = SimpleNamespace(num_actual_tokens=2, num_decodes=2, num_prefills=0, num_decode_tokens=2)
+        metadata = SimpleNamespace(
+            num_actual_tokens=2, num_decodes=2, num_prefills=0, num_decode_tokens=2, external_flashmla=None
+        )
         with (
             patch.object(mla_v1, "_EXTRA_CTX", SimpleNamespace(num_tokens=2)),
             patch.object(mla_v1, "maybe_save_kv_layer_to_connector"),
@@ -2776,6 +2814,7 @@ class TestAscendMLAImpl(TestBase):
         kv_cache = MagicMock()
 
         attn_metadata = MagicMock()
+        attn_metadata.external_flashmla = None
         attn_metadata.num_decodes = 2
         attn_metadata.num_prefills = 2
         attn_metadata.num_decode_tokens = 2
@@ -2969,6 +3008,7 @@ class TestAscendMLAImpl(TestBase):
         k_nope = torch.randn(BS, N, self.impl.kv_lora_rank)
         k_pe = torch.randn(BS, N, self.impl.qk_rope_head_dim)
         attn_metadata = MagicMock()
+        attn_metadata.external_flashmla = None
         attn_metadata.attn_state = AscendAttentionState.SpecDecoding
         attn_metadata.decode = MagicMock()
         attn_metadata.decode.actual_seq_qlen = MagicMock()
@@ -3046,6 +3086,7 @@ class TestAscendMLAImpl(TestBase):
         k_nope = torch.randn(BS, num_heads, impl.kv_lora_rank)
         k_pe = torch.randn(BS, num_heads, impl.qk_rope_head_dim)
         attn_metadata = MagicMock()
+        attn_metadata.external_flashmla = None
         attn_metadata.attn_state = AscendAttentionState.SpecDecoding
         attn_metadata.decode = MagicMock()
         attn_metadata.decode.actual_seq_qlen = MagicMock()
@@ -3133,6 +3174,7 @@ class TestAscendMLAImpl(TestBase):
         k_nope = torch.randn(BS, num_heads, impl.kv_lora_rank)
         k_pe = torch.randn(BS, num_heads, impl.qk_rope_head_dim)
         attn_metadata = MagicMock()
+        attn_metadata.external_flashmla = None
         attn_metadata.attn_state = AscendAttentionState.DecodeOnly
         attn_metadata.decode = MagicMock()
         attn_metadata.decode.actual_seq_qlen = MagicMock()
@@ -3183,6 +3225,7 @@ class TestAscendMLAImpl(TestBase):
         k_nope = torch.randn(BS, self.impl.num_kv_heads, self.impl.kv_lora_rank)
         k_pe = torch.randn(BS, self.impl.num_kv_heads, self.impl.qk_rope_head_dim)
         attn_metadata = MagicMock()
+        attn_metadata.external_flashmla = None
         attn_metadata.attn_state = AscendAttentionState.SpecDecoding
         attn_metadata.decode = MagicMock()
         attn_metadata.decode.actual_seq_qlen = MagicMock()
