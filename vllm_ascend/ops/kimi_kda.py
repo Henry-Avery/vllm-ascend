@@ -12,6 +12,7 @@ from functools import wraps
 import torch
 import torch_npu
 from einops import rearrange
+from fla_npu.ops.ascendc import causal_conv1d_fn, causal_conv1d_update
 from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
@@ -35,7 +36,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence im
 )
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.kda import run_chunk_kda, run_recurrent_kda
-from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
+from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_ssm_states_
 from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
     AscendW4A8MXFPDynamicLinearMethod,
 )
@@ -156,6 +157,15 @@ class _KDAFusedBFGLinear(MergedColumnParallelLinear):
         param_shard.copy_(fused_weight)
 
 
+def _normalize_causal_cache_indices(cache_indices: torch.Tensor) -> torch.Tensor:
+    """Normalize vLLM cache indices to one index per request."""
+    if cache_indices.dim() == 1:
+        return cache_indices.contiguous()
+    if cache_indices.dim() == 2:
+        return cache_indices[:, 0].contiguous()
+    raise ValueError(f"KDA causal cache_indices must be 1D or 2D, got shape={tuple(cache_indices.shape)}")
+
+
 def _prepare_beta(
     beta: torch.Tensor,
     num_actual_tokens: int,
@@ -214,7 +224,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         # by the validated v0.26 implementation.
         self.o_norm.eps = config.rms_norm_eps
         # vLLM keeps the checkpoint-compatible FP32 [3C, 1, W] weight, while
-        # npu_causal_conv1d_custom consumes an activation-dtype [W, 3C]
+        # fla_npu causal_conv1d consumes an activation-dtype [W, 3C]
         # tensor. Materialize that kernel layout once after weight loading.
         self.register_parameter(
             _PACKED_CONV_WEIGHT_NAME,
@@ -376,25 +386,39 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         initial_state_mode: torch.Tensor | None,
         *,
         run_mode: int,
+        max_query_len: int = -1,
         num_accepted_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        cache_indices = _normalize_causal_cache_indices(cache_indices)
+        if run_mode == 0:
+            return causal_conv1d_fn(
+                mixed_qkv,
+                conv_weights_t,
+                None,
+                conv_states=conv_state,
+                query_start_loc=query_start_loc,
+                cache_indices=cache_indices,
+                has_initial_state=initial_state_mode,
+                activation="silu",
+                pad_slot_id=PAD_SLOT_ID,
+                null_block_id=0,
+            )
+        if run_mode != 1:
+            raise ValueError(f"Unsupported causal_conv1d run_mode: {run_mode}")
+
         output = torch.empty_like(mixed_qkv)
-        # Consume the operator's declared output alias. Returning ``output``
-        # independently would let graph functionalization treat the custom-op
-        # result as dead and expose the uninitialized allocation instead.
-        return torch.ops._C_ascend.npu_causal_conv1d_custom(
-            output,
+        return causal_conv1d_update(
             mixed_qkv,
+            conv_state,
             conv_weights_t,
-            conv_state=conv_state,
-            bias_opt=None,
-            query_start_loc_opt=query_start_loc,
-            cache_indices_opt=cache_indices,
-            initial_state_mode_opt=initial_state_mode,
-            num_accepted_tokens_opt=num_accepted_tokens,
-            activation_mode=1,
-            pad_slot_id=PAD_SLOT_ID,
-            run_mode=run_mode,
+            bias=None,
+            activation="silu",
+            conv_state_indices=cache_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            query_start_loc=query_start_loc,
+            max_query_len=max_query_len,
+            null_block_id=0,
+            out=output,
         )
 
     @torch.no_grad()
@@ -467,8 +491,10 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
 
         # The recurrent cache uses [H,V,K]. The fused prefill operator accepts
         # that state layout directly through state_v_first.
-        initial_state_vk = recurrent_state[state_indices].contiguous()
-        clear_ssm_states(initial_state_vk, has_initial_state)
+        # CANN advanced indexing can normalize the entire strided shared
+        # pool. Read only live [H,V,K] payloads using their physical stride;
+        # false initial-state flags and invalid slots gather zero.
+        initial_state_vk = gather_ssm_states(recurrent_state, state_indices, has_initial_state)
 
         output, final_state = run_chunk_kda(
             q,
@@ -483,7 +509,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             self.dt_bias,
             lower_bound=self.gate_lower_bound,
         )
-        recurrent_state[state_indices] = final_state.to(recurrent_state.dtype)
+        scatter_ssm_states_(recurrent_state, state_indices, final_state)
         return output
 
     @eager_break_during_capture
@@ -566,6 +592,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 spec_conv_meta.cache_indices,
                 None,
                 run_mode=1,
+                max_query_len=self.num_spec + 1,
                 num_accepted_tokens=spec_conv_meta.num_accepted_tokens,
             )
             q_spec, k_spec, v_spec = (
@@ -611,6 +638,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                     decode_meta.causal_conv1d.cache_indices,
                     None,
                     run_mode=1,
+                    max_query_len=1,
                 )
 
             q_non_spec, k_non_spec, v_non_spec = (
