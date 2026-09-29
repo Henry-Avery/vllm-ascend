@@ -122,6 +122,8 @@ from vllm.v1.worker.utils import (
     raise_if_nan_logits,
 )
 
+from vllm_ascend import envs as ascend_envs
+
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
@@ -3419,7 +3421,7 @@ class NPUModelRunner(GPUModelRunner):
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         has_initial_state = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
-        if self.use_dcp or self.model_config.is_hybrid:
+        if self.use_dcp or self.model_config.is_hybrid or ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
             # Mamba prompt chunks must retain prefill state semantics even when
             # their width matches the speculative decode graph. DCP also
             # requires the full prompt to be computed before uniform decode.
@@ -3444,6 +3446,13 @@ class NPUModelRunner(GPUModelRunner):
             else len(self.input_batch.lora_id_to_lora_request)
         )
         has_lora = num_active_loras > 0 if force_has_lora is None else force_has_lora
+        flashmla_prefill = (
+            ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA
+            and force_uniform_decode is None
+            and np.any(
+                self.input_batch.num_computed_tokens_cpu[:num_reqs] < self.input_batch.num_prompt_tokens[:num_reqs]
+            )
+        )
 
         # ruff: noqa: E731
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
@@ -3455,7 +3464,7 @@ class NPUModelRunner(GPUModelRunner):
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
                 valid_modes=valid_modes,
-                invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                invalid_modes={CUDAGraphMode.FULL} if disable_full or flashmla_prefill else None,
                 num_active_loras=num_active_loras,
             )
 
@@ -3841,6 +3850,10 @@ class NPUModelRunner(GPUModelRunner):
             )
 
             extra_attn_metadata_args: dict[str, Any] = {}
+            if getattr(builder, "flashmla_state", None) is not None:
+                # FULL execution must preserve the schedule's ExternalEvent
+                # frontier across capture and replay.
+                extra_attn_metadata_args["retain_for_graph"] = cudagraph_runtime_mode == CUDAGraphMode.FULL
             if isinstance(builder, GDNAttentionMetadataBuilder) and not is_gdn_noop:
                 assert ubid is None, "UBatching not supported with GDN yet"
                 extra_attn_metadata_args["num_actual_reqs"] = num_reqs
@@ -6241,7 +6254,7 @@ class NPUModelRunner(GPUModelRunner):
             for attn_groups in self.attn_groups
             for attn_group in attn_groups
             for builder in attn_group.metadata_builders
-            if isinstance(builder, DeviceMetadataTaskProvider)
+            if isinstance(builder, DeviceMetadataTaskProvider) and getattr(builder, "uses_device_metadata", True)
         }
         if device_metadata_providers:
             self.device_metadata_executor = DeviceMetadataExecutor()

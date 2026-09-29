@@ -12,6 +12,7 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
 from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
 
+from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_ssm_states_
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 
 
@@ -33,7 +34,7 @@ def copy_kv_cache_blocks_inplace(
         return
 
     cache_tensors: list[torch.Tensor] = []
-    seen_tensors: set[int] = set()
+    seen_tensors: set[tuple] = set()
     for entry in kv_caches:
         if entry is None:
             continue
@@ -41,10 +42,10 @@ def copy_kv_cache_blocks_inplace(
         for tensor in tensors:
             if tensor is None:
                 continue
-            data_ptr = tensor.data_ptr()
-            if data_ptr in seen_tensors:
+            view_key = (tensor.data_ptr(), tuple(tensor.shape), tensor.stride(), tensor.dtype)
+            if view_key in seen_tensors:
                 continue
-            seen_tensors.add(data_ptr)
+            seen_tensors.add(view_key)
             cache_tensors.append(tensor)
 
     if not cache_tensors:
@@ -57,16 +58,35 @@ def copy_kv_cache_blocks_inplace(
     )
     indices = async_tensor_h2d(indices_np, device=device)
     src_indices, dst_indices = indices.unbind(dim=1)
+    pending_copies = []
     for tensor in cache_tensors:
         assert tensor.device == device
         assert tensor.shape[0] % num_blocks == 0
         kernel_blocks_per_block = tensor.shape[0] // num_blocks
+        if not tensor.is_contiguous() and tensor[0].is_contiguous():
+            # CANN index_select/index_copy can normalize an entire padded
+            # pool. Gather every source kernel payload before any scatter so
+            # COW also preserves simultaneous-copy semantics and page gaps.
+            offsets = torch.arange(kernel_blocks_per_block, device=device)
+            source_rows = (src_indices[:, None] * kernel_blocks_per_block + offsets).reshape(-1)
+            destination_rows = (dst_indices[:, None] * kernel_blocks_per_block + offsets).reshape(-1)
+            source_states = gather_ssm_states(tensor, source_rows, torch.ones_like(source_rows, dtype=torch.bool))
+            pending_copies.append((tensor, destination_rows, source_states, True))
+            continue
         # Page-strided MLA views are non-contiguous, so a flat ``view`` would
         # either fail or materialize a copy. Split only dim 0 to preserve the
         # original strided storage while copying every kernel block in a page.
         blocks = tensor.unflatten(0, (num_blocks, kernel_blocks_per_block))
         source_blocks = torch.index_select(blocks, 0, src_indices)
-        blocks.index_copy_(0, dst_indices, source_blocks)
+        pending_copies.append((blocks, dst_indices, source_blocks, False))
+
+    # Distinct views can start at the same pointer and overlap within a page.
+    # Snapshot all sources before any destination write, including aliases.
+    for target, destination_rows, source, uses_state_copy in pending_copies:
+        if uses_state_copy:
+            scatter_ssm_states_(target, destination_rows, source)
+        else:
+            target.index_copy_(0, destination_rows, source)
 
 
 def get_single_raw_mla_backing(raw_cache: object) -> torch.Tensor | None:

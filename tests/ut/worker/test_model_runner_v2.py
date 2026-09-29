@@ -30,6 +30,8 @@ def _make_runner(need_timing: bool = True):
     runner.execute_model_state = None
     runner.is_last_pp_rank = False
     runner.attn_groups = []
+    runner.cudagraph_manager = None
+    runner.flashmla_executor = None
     runner.adaptive_verification = None
     runner.use_fia = False
     # Set by NPUModelRunner.__init__ on real instances.
@@ -143,6 +145,74 @@ def test_execute_model_records_profiling_time():
         "valid_dummy_state_slots": False,
     }
     mock_execute_model.assert_called_once_with(scheduler_output, **expected_kwargs)
+
+
+def test_profile_dummy_run_before_attention_groups_init():
+    runner = _make_runner(need_timing=False)
+    del runner.attn_groups
+    runner.flashmla_executor = object()
+    scheduler_output = SimpleNamespace(disable_profiling_timing=True)
+
+    def profile_forward(scheduler_output, **kwargs):
+        # Exercise the real subclass hook reached by the upstream dummy run.
+        assert runner.gather_batch_req_state(scheduler_output, kwargs["dummy_run"]) == (None, 1)
+
+    with (
+        patch.object(GPUModelRunner, "execute_model", side_effect=profile_forward) as mock_execute_model,
+        patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(None, 1)),
+    ):
+        runner.execute_model(
+            scheduler_output,
+            dummy_run=True,
+            skip_attn_for_dummy_run=True,
+            is_profile=True,
+        )
+
+    mock_execute_model.assert_called_once()
+
+    with pytest.raises(RuntimeError, match="attention groups are unavailable"):
+        runner.execute_model(scheduler_output)
+
+
+@pytest.mark.parametrize("flashmla_enabled", [False, True])
+def test_dummy_gather_clears_stale_prefill_flag(flashmla_enabled):
+    runner = _make_runner(need_timing=False)
+    runner.cudagraph_manager = SimpleNamespace(flashmla_has_prefill=True)
+    with (
+        patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(None, 1)),
+        patch("vllm_ascend.worker.v2.model_runner.ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA", flashmla_enabled),
+    ):
+        assert runner.gather_batch_req_state(SimpleNamespace(), dummy_run=True) == (None, 1)
+    assert runner.cudagraph_manager.flashmla_has_prefill is False
+
+
+def test_flashmla_gather_keeps_short_prefill_and_reorders_all_request_fields():
+    runner = _make_runner(need_timing=False)
+    runner.cudagraph_manager = SimpleNamespace(flashmla_has_prefill=False)
+    # A one-token prompt suffix remains FIA prefill even when decode has the
+    # same width. Request identity and every indexed field must move together.
+    batch_state = _make_batch_state([127, 64, 20, 90], [1, 1, 3, 1], [128, 64, 40, 90])
+    with (
+        patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(batch_state, None)),
+        patch("vllm_ascend.worker.v2.model_runner.is_pd_decode_recompute_scheduler_enabled", return_value=False),
+        patch("vllm_ascend.worker.v2.model_runner.ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA", True),
+    ):
+        gathered, uniform = runner.gather_batch_req_state(SimpleNamespace(), False)
+
+    order = [1, 3, 0, 2]
+    assert gathered.req_ids == [batch_state.req_ids[i] for i in order]
+    for name in (
+        "num_scheduled_tokens",
+        "idx_mapping_np",
+        "prefill_len_np",
+        "num_computed_prefill_tokens_np",
+        "is_prefilling_np",
+    ):
+        np.testing.assert_array_equal(getattr(gathered, name), getattr(batch_state, name)[order])
+    assert gathered.num_tokens == batch_state.num_tokens
+    assert gathered.has_prefill
+    assert runner.cudagraph_manager.flashmla_has_prefill
+    assert uniform is None
 
 
 def test_execute_model_disables_profiling_timer_and_clears_stale_time():

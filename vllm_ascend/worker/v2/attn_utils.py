@@ -76,14 +76,42 @@ from vllm_ascend.utils import (
     is_hidden_state_cache_spec,
     vllm_version_is,
 )
+from vllm_ascend.worker.device_metadata import DeviceMetadataExecutor
 from vllm_ascend.worker.kvpp_cache import allocate_kvpp_cache
 from vllm_ascend.worker.utils import (
     get_single_raw_mla_backing,
     make_page_strided_cache_view,
+    row_major_strides,
 )
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
+
+
+@contextmanager
+def flashmla_metadata_scope(attn_groups, executor: DeviceMetadataExecutor | None):
+    """Bind a worker's executor to its MLA builders, without global state.
+
+    Keep ownership until target/draft consumers have been queued. Nested scopes
+    using the same builders leave release to the owner of the outer scope.
+    """
+    if executor is None:
+        yield
+        return
+    changed = []
+    for groups in attn_groups:
+        for group in groups:
+            state = getattr(group.get_metadata_builder(0), "flashmla_state", None)
+            if state is not None and state.executor is not executor:
+                changed.append((state, state.executor, state.defer))
+                state.executor, state.defer = executor, True
+    try:
+        yield
+    finally:
+        if changed and executor.submission_in_flight:
+            executor.release()
+        for state, previous_executor, previous_defer in changed:
+            state.executor, state.defer = previous_executor, previous_defer
 
 
 def unwrap_mamba_kv_cache_groups(kv_cache_config: KVCacheConfig) -> KVCacheConfig:
@@ -262,6 +290,19 @@ def build_attn_metadata(
     causal: bool | Mapping[int, bool] = True,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
+    flashmla_executors = {
+        state.executor
+        for groups in attn_groups
+        for group in groups
+        if (state := getattr(group.get_metadata_builder(0), "flashmla_state", None)) is not None
+        and state.executor is not None
+    }
+    if len(flashmla_executors) > 1:
+        raise RuntimeError("One attention build cannot share buffers across multiple FlashMLA executors")
+    executor = next(iter(flashmla_executors), None)
+    if executor is not None and executor.submission_in_flight:
+        executor.release()
+    flashmla_tasks = []
     if seq_lens_np is None:
         if seq_lens_cpu_upper_bound is not None:
             # FIA needs a CPU-side seq_lens upper bound for each request when
@@ -397,8 +438,17 @@ def build_attn_metadata(
                 # Preserve sharing even if a builder replaces one of the
                 # dictionaries while constructing its metadata.
                 common_ratio_to_sas_metadata = attn_metadata_builder.common_ratio_to_sas_metadata  # type: ignore[assignment]
+            if executor is not None and getattr(attn_metadata_builder, "flashmla_state", None) is not None:
+                flashmla_tasks.extend(attn_metadata_builder.take_device_metadata_tasks())
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
+    if flashmla_tasks:
+        if torch.npu.is_current_stream_capturing():
+            raise RuntimeError("FlashMLA metadata must be refreshed outside model capture/replay")
+        assert executor is not None
+        executor.submit(flashmla_tasks)
+        for task in flashmla_tasks:
+            executor.wait(task.stage, task.group_id)
     return attn_metadata
 
 
@@ -475,26 +525,26 @@ def _adjust_dsv4_kv_layout(
     page_size_bytes: int,
     overlap_full_kv_cache: bool = False,
 ) -> list[torch.Tensor]:
+    if raw_tensor.element_size() != 1 or not raw_tensor.is_contiguous():
+        raise ValueError("Page views require a contiguous raw byte allocation.")
+    if page_size_bytes <= 0 or len(cache_shapes) != len(cache_dtypes):
+        raise ValueError("Page views require a positive page size and matching shapes/dtypes.")
     caches = []
-    base_offset_bytes = raw_tensor.storage_offset() * raw_tensor.element_size()
-    offset_bytes = base_offset_bytes
+    offset_bytes = 0
     for index, (shape, dtype) in enumerate(zip(cache_shapes, cache_dtypes)):
         if overlap_full_kv_cache and index == 2:
-            offset_bytes = base_offset_bytes
+            offset_bytes = 0
         dtype_size = get_dtype_size(dtype)
-        page_stride = page_size_bytes // dtype_size
-        stride = torch.empty(shape).stride()
-        if offset_bytes % dtype_size:
-            raise ValueError(f"DSA cache offset {offset_bytes} is not aligned to {dtype}.")
-        caches.append(
-            torch.as_strided(
-                raw_tensor.view(dtype),
-                size=shape,
-                stride=(page_stride, *stride[1:]),
-                storage_offset=offset_bytes // dtype_size,
-            )
-        )
-        offset_bytes += stride[0] * dtype_size
+        stride = row_major_strides(shape)
+        if page_size_bytes % dtype_size or (raw_tensor.storage_offset() + offset_bytes) % dtype_size:
+            raise ValueError(f"Cache page/offset is not aligned to {dtype}.")
+        payload_bytes = stride[0] * dtype_size
+        if offset_bytes + payload_bytes > page_size_bytes:
+            raise ValueError("Cache payloads exceed their physical page.")
+        if shape[0] and (shape[0] - 1) * page_size_bytes + offset_bytes + payload_bytes > raw_tensor.numel():
+            raise ValueError("Cache page view exceeds its raw allocation.")
+        caches.append(make_page_strided_cache_view(raw_tensor, shape, dtype, page_size_bytes, offset_bytes))
+        offset_bytes += payload_bytes
     return caches
 
 
@@ -850,7 +900,7 @@ def _allocate_kv_cache(
                 layer_size = kv_cache_config.num_blocks * layer_spec.page_size_bytes
                 start = kv_cache_tensor.offset + layer_idx * kv_cache_tensor.layer_stride
                 end = start + layer_size
-                if end > hybrid_backing.numel():
+                if start < 0 or end > hybrid_backing.numel():
                     raise ValueError(f"Hybrid KV cache view for {layer_name} exceeds the backing allocation.")
                 kv_cache_raw_tensors[layer_name] = hybrid_backing[start:end]
             continue
@@ -872,7 +922,7 @@ def _allocate_kv_cache(
                     )
                 start = kv_cache_tensor.offset + layer_idx * kv_cache_tensor.layer_stride
                 end = start + layer_size
-                if end > hybrid_backing.numel():
+                if start < 0 or end > hybrid_backing.numel():
                     raise ValueError(f"Hybrid KV cache view for {layer_name} exceeds the backing allocation.")
                 kv_cache_raw_tensors[layer_name] = hybrid_backing[start:end]
             continue
@@ -1247,7 +1297,11 @@ def _reshape_kv_cache_v2(
             single_raw_mla_cache = get_single_raw_mla_backing(raw_cache)
 
             if single_raw_mla_cache is not None and _uses_single_raw_mla_cache(vllm_config, layer_name, kv_cache_spec):
+                if kv_cache_spec.block_size % kernel_block_size:
+                    raise ValueError("MLA manager blocks must contain whole kernel blocks.")
                 kernel_blocks_per_manager = kv_cache_spec.block_size // kernel_block_size
+                if kv_cache_spec.page_size_bytes % kernel_blocks_per_manager:
+                    raise ValueError("MLA physical pages must split into whole kernel pages.")
                 slot_bytes = kv_cache_spec.page_size_bytes // kernel_blocks_per_manager
                 component_shape = (
                     kv_cache_config.num_blocks * kernel_blocks_per_manager,
@@ -1256,6 +1310,10 @@ def _reshape_kv_cache_v2(
                 )
                 nope_dim, rope_dim = _get_attention_kv_cache_dims(layer_name, kv_cache_spec)
                 fused_dim = nope_dim + rope_dim
+                dtype_size = get_dtype_size(kv_cache_spec.dtype)
+                payload_bytes = kernel_block_size * kv_cache_spec.num_kv_heads * fused_dim * dtype_size
+                if slot_bytes % dtype_size or payload_bytes > slot_bytes:
+                    raise ValueError("MLA kernel payload must fit in an aligned physical kernel page.")
 
                 if (
                     get_current_hardware_profile().supports(HardwareCapability.MLA_FLASH)
