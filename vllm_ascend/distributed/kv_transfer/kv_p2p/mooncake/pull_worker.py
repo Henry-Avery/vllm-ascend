@@ -12,6 +12,7 @@ import msgspec
 import torch
 import zmq
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorTransferResults
 from vllm.logger import logger
 from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -32,6 +33,7 @@ from vllm_ascend.core.kv_cache_interface import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker import (
     MooncakeBaseConnectorWorker,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.layout import FUSED_MLA_PROTOCOL_VERSION
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
     MooncakePPTransferMetadata,
@@ -137,7 +139,7 @@ class MooncakePullRecvingThread(threading.Thread):
         # -> [(local_layer_index, remote_layer_index), ...]
         self.remote_layer_index_pairs: SizedDict[str, dict[int, list[tuple[int, int]]]] = SizedDict()
         self.request_queue: queue.Queue[tuple[str, dict[str, ReqMeta]]] = queue.Queue()
-        self.finished_requests: queue.SimpleQueue[str] = queue.SimpleQueue()
+        self.finished_requests: queue.SimpleQueue[tuple[str, bool]] = queue.SimpleQueue()
         self.invalid_block_ids: set[int] = set()
         self.invalid_block_ids_lock = threading.Lock()
         assert self.local_metadata is not None
@@ -153,12 +155,20 @@ class MooncakePullRecvingThread(threading.Thread):
 
     def get_and_clear_finished_requests(self) -> set[str]:
         """Drain requests whose transfer attempt has completed."""
+        return self.get_and_clear_transfer_results().finished_recving
+
+    def get_and_clear_transfer_results(self) -> KVConnectorTransferResults:
+        """Each queue entry atomically publishes completion and failure."""
         finished: set[str] = set()
+        failed: set[str] = set()
         while True:
             try:
-                finished.add(self.finished_requests.get_nowait())
+                request_id, load_failed = self.finished_requests.get_nowait()
+                finished.add(request_id)
+                if load_failed:
+                    failed.add(request_id)
             except queue.Empty:
-                return finished
+                return KVConnectorTransferResults(finished_recving=finished, failed_recving=failed)
 
     def get_and_clear_invalid_block_ids(self) -> set[int]:
         """Drain local block IDs affected by failed pull attempts."""
@@ -174,6 +184,7 @@ class MooncakePullRecvingThread(threading.Thread):
         while True:
             remote_engine_id, requests = self.request_queue.get()
             request_endpoints = {(request.remote_host, request.remote_port) for request in requests.values()}
+            failed_request_ids: set[str] = set()
             try:
                 remote_host, remote_port = self._get_remote_endpoint(request_endpoints)
                 failed_request_ids = self._handle_requests(
@@ -185,6 +196,7 @@ class MooncakePullRecvingThread(threading.Thread):
                 for request_id in failed_request_ids:
                     self._mark_request_failed(requests[request_id])
             except Exception as exc:
+                failed_request_ids = set(requests)
                 if self.can_report_invalid_block_ids:
                     for request_metadata in requests.values():
                         self._mark_request_failed(request_metadata)
@@ -196,7 +208,7 @@ class MooncakePullRecvingThread(threading.Thread):
                 )
             finally:
                 for request_id in requests:
-                    self.finished_requests.put(request_id)
+                    self.finished_requests.put((request_id, request_id in failed_request_ids))
                 self.request_queue.task_done()
 
     def _mark_request_failed(self, request_metadata: ReqMeta) -> None:
@@ -240,6 +252,7 @@ class MooncakePullRecvingThread(threading.Thread):
         raw_tp_rank_groups_by_spec: dict[int, list[list[int]]] = {}
 
         for remote_pp_rank, pp_metadata in sorted(remote_metadata.metadata_by_pp_rank.items()):
+            self._validate_fused_mla_layout(remote_metadata, pp_metadata)
             layer_index_pairs: list[tuple[int, int]] = []
             groups_by_layer_pair: dict[tuple[int, int], list[list[int]]] = {}
             remote_layer_index_by_name = {
@@ -303,6 +316,37 @@ class MooncakePullRecvingThread(threading.Thread):
                 f"Mooncake producer metadata is missing layers required by this worker: {missing_local_layers}"
             )
         return groups_by_pp_rank, layer_pairs_by_pp_rank
+
+    def _validate_fused_mla_layout(
+        self, remote: MooncakeTransferMetadataGroups, pp_metadata: MooncakePPTransferMetadata
+    ) -> None:
+        local = self.local_metadata
+        if not local.fused_mla_protocol and not pp_metadata.fused_mla_protocol:
+            return
+        if local.fused_mla_protocol != FUSED_MLA_PROTOCOL_VERSION or (
+            pp_metadata.fused_mla_protocol != FUSED_MLA_PROTOCOL_VERSION
+        ):
+            raise ValueError("Fused MLA PD requires the same versioned layout protocol on P and D")
+        if (
+            (self.tp_size, self.pp_size, self.pcp_size, self.dcp_size)
+            != (remote.tp_size, remote.pp_size, remote.pcp_size, remote.dcp_size)
+            or self.pcp_size != 1
+            or self.dcp_size != 1
+            or remote.use_kv_pp
+        ):
+            raise ValueError("Fused MLA PD requires equal TP/PP, PCP=DCP=1 and no KV parallel placement")
+        if local.layer_layouts is None or pp_metadata.layer_layouts is None:
+            raise ValueError("Fused MLA PD peer is missing layer layouts")
+        if len(pp_metadata.layer_layouts) != len(pp_metadata.layer_names):
+            raise ValueError("Fused MLA PD peer has an incomplete layout table")
+        remote_indices = {name: index for index, name in enumerate(pp_metadata.layer_names)}
+        for index, name in enumerate(local.layer_names):
+            remote_index = remote_indices.get(name)
+            if remote_index is None:
+                continue  # The PP-union layer check below diagnoses missing layers.
+            for field_name in ("layer_layouts", "layer_block_sizes", "block_size_scales", "block_lens"):
+                if getattr(local, field_name)[index] != getattr(pp_metadata, field_name)[remote_index]:
+                    raise ValueError(f"Fused MLA PD incompatible {field_name} for layer {name!r}")
 
     def _get_layer_remote_tp_rank_groups(
         self,
@@ -572,14 +616,7 @@ class MooncakePullRecvingThread(threading.Thread):
                     remote_tp_rank,
                     sorted(request_ids),
                 )
-                if self.can_report_invalid_block_ids:
-                    failed_request_ids.update(request_ids)
-                else:
-                    logger.warning(
-                        "Ignoring Mooncake transfer failure for hybrid KV cache requests %s because "
-                        "vLLM invalid block reporting currently supports only one KV cache group",
-                        sorted(request_ids),
-                    )
+                failed_request_ids.update(request_ids)
 
         if submission_error is not None:
             raise submission_error
@@ -1559,6 +1596,11 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
             self._recving_thread.get_and_clear_finished_requests() if self._recving_thread is not None else set()
         )
         return set(), finished_recving
+
+    def get_transfer_results(self) -> KVConnectorTransferResults:
+        if self._recving_thread is None:
+            return KVConnectorTransferResults()
+        return self._recving_thread.get_and_clear_transfer_results()
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Return local block IDs whose pull operations failed."""

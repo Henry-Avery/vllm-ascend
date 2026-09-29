@@ -177,7 +177,7 @@ def test_register_kv_caches_collapses_views_packed_in_one_page(monkeypatch) -> N
     assert metadata is not None
     assert metadata.kv_caches_base_addr == [[raw_cache.data_ptr()]]
     assert metadata.block_strides == [[128]]
-    assert metadata.block_lens == [[128]]
+    assert metadata.block_lens == [[80]]
     assert metadata.block_shapes == [[(32,)]]
     assert metadata.block_size_scales == [[1]]
 

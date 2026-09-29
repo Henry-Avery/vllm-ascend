@@ -102,8 +102,8 @@ def test_remote_endpoint_requires_one_endpoint() -> None:
 
 def test_result_queues_are_drained_atomically() -> None:
     thread = make_thread()
-    thread.finished_requests.put("request-a")
-    thread.finished_requests.put("request-b")
+    thread.finished_requests.put(("request-a", False))
+    thread.finished_requests.put(("request-b", True))
     thread.invalid_block_ids = {10, 11}
 
     assert thread.get_and_clear_finished_requests() == {"request-a", "request-b"}
@@ -917,7 +917,7 @@ def test_execute_bucket_uses_selected_pcp_endpoint_and_addresses() -> None:
     )
 
 
-@pytest.mark.parametrize(("can_report", "expected_failed"), [(True, {"request-b"}), (False, set())])
+@pytest.mark.parametrize(("can_report", "expected_failed"), [(True, {"request-b"}), (False, {"request-b"})])
 def test_handle_requests_attributes_failed_tp_to_affected_requests(
     can_report: bool,
     expected_failed: set[str],

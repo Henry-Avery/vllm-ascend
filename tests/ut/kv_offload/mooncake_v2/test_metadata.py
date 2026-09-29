@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import replace
+
 import msgspec
 import pytest
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.layout import MooncakeLayerLayout
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
     MooncakeTransferMetadataGroups,
@@ -85,3 +88,12 @@ def test_connector_metadata_adds_complete_request() -> None:
     assert request.local_num_prompt_tokens == 32
     assert request.num_computed_tokens == 16
     assert request.remote_request_id == "request-p"
+
+
+def test_fused_layout_msgpack_round_trip() -> None:
+    groups = make_metadata_groups()
+    pp = groups.metadata_by_pp_rank[0]
+    layout = MooncakeLayerLayout("AscendMLAAttentionSpec", ("torch.bfloat16",), ((128, 1, 576),), ((576, 576, 1),))
+    pp = replace(pp, fused_mla_protocol=1, layer_layouts=[layout for _ in pp.layer_names])
+    groups = replace(groups, metadata_by_pp_rank={0: pp})
+    assert msgspec.msgpack.decode(msgspec.msgpack.encode(groups), type=MooncakeTransferMetadataGroups) == groups

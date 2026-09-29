@@ -58,7 +58,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_draft_graph_params_workspaces,
     update_graph_params_workspaces,
 )
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, supports_flashmla_pd
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
@@ -1031,8 +1031,11 @@ class AscendMLAImpl(MLAAttentionImpl):
             raise ValueError("External FlashMLA integration requires unquantized BF16/FP16 BBND cache")
         if self.pcp_enabled or config.parallel_config.decode_context_parallel_size != 1:
             raise ValueError("External FlashMLA currently requires PCP=1 and DCP=1; distributed adaptation is separate")
-        if config.kv_transfer_config is not None:
-            raise ValueError("External FlashMLA with the PR16456 cache requires colocated serving without KV transfer")
+        if not supports_flashmla_pd(config):
+            raise ValueError(
+                "External FlashMLA PD requires MooncakeConnectorV2/MooncakePullConnector, "
+                "PCP=DCP=1 and no speculative decoding; PD + DSpark is not enabled yet"
+            )
         logger.info_once("[FlashMLA] configured: external decode, FIA prefill, shared PR16456 BBND cache")
 
     @staticmethod
