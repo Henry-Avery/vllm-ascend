@@ -192,7 +192,7 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                 for tp_rank, worker_metadata in workers_by_tp_rank.items():
                     mismatched_fields = [
                         field_name
-                        for field_name in ("block_size", "num_blocks")
+                        for field_name in ("block_size", "num_blocks", "fused_mla_protocol")
                         if getattr(worker_metadata, field_name) != getattr(reference, field_name)
                     ]
                     if mismatched_fields:
@@ -233,6 +233,7 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                             worker_metadata.block_lens[local_layer_index],
                             worker_metadata.block_shapes[local_layer_index],
                             worker_metadata.block_size_scales[local_layer_index],
+                            worker_metadata.layer_layouts[local_layer_index] if worker_metadata.layer_layouts else None,
                         )
                         previous_signature = layer_signature_by_name.get(layer_name)
                         if previous_signature is not None and previous_signature != layer_signature:
@@ -243,6 +244,7 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                                 "block_lens",
                                 "block_shapes",
                                 "block_size_scales",
+                                "layer_layouts",
                             )
                             mismatched_layer_fields = [
                                 field_name
@@ -265,6 +267,7 @@ class MooncakeSchedulerSendingThread(threading.Thread):
             block_lens: list[list[int]] = []
             block_shapes: list[list[tuple[int, ...]]] = []
             block_size_scales: list[list[int]] = []
+            layer_layouts = []
             for layer_name in layer_names:
                 worker_metadata, local_layer_index = layer_source_by_name[layer_name]
                 layer_block_sizes.append(worker_metadata.layer_block_sizes[local_layer_index])
@@ -273,6 +276,8 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                 block_lens.append(worker_metadata.block_lens[local_layer_index])
                 block_shapes.append(worker_metadata.block_shapes[local_layer_index])
                 block_size_scales.append(worker_metadata.block_size_scales[local_layer_index])
+                if worker_metadata.layer_layouts is not None:
+                    layer_layouts.append(worker_metadata.layer_layouts[local_layer_index])
 
             layer_index_by_name = {layer_name: layer_index for layer_index, layer_name in enumerate(layer_names)}
             metadata_by_pcp_rank: dict[int, MooncakePCPTransferMetadata] = {}
@@ -308,6 +313,8 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                 block_shapes=block_shapes,
                 block_size_scales=block_size_scales,
                 metadata_by_pcp_rank=metadata_by_pcp_rank,
+                fused_mla_protocol=reference.fused_mla_protocol,
+                layer_layouts=layer_layouts if len(layer_layouts) == len(layer_names) else None,
             )
         return merged
 

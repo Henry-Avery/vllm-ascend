@@ -12,6 +12,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.layout import MooncakeLayerLayout
+
 
 @dataclass(frozen=True)
 class MooncakeTransferMetadata(KVConnectorHandshakeMetadata):
@@ -35,9 +37,13 @@ class MooncakeTransferMetadata(KVConnectorHandshakeMetadata):
     block_size_scales: list[list[int]]
     local_ip: str = ""
     handshake_port: int = 0
+    fused_mla_protocol: int = 0
+    layer_layouts: list[MooncakeLayerLayout] | None = None
 
     def __post_init__(self) -> None:
         num_layers = len(self.layer_names)
+        if self.fused_mla_protocol and (self.layer_layouts is None or len(self.layer_layouts) != num_layers):
+            raise ValueError("Fused MLA transfer metadata requires a layout for every layer")
         per_layer_fields: tuple[tuple[str, Sequence[object]], ...] = (
             ("layer_block_sizes", self.layer_block_sizes),
             ("group_indices", self.group_indices),
@@ -105,6 +111,8 @@ class MooncakePPTransferMetadata:
     block_shapes: list[list[tuple[int, ...]]]
     block_size_scales: list[list[int]]
     metadata_by_pcp_rank: dict[int, MooncakePCPTransferMetadata]
+    fused_mla_protocol: int = 0
+    layer_layouts: list[MooncakeLayerLayout] | None = None
 
 
 @dataclass(frozen=True)

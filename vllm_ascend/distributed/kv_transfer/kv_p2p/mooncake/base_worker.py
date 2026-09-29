@@ -12,6 +12,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import get_pcp_group
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
+    KVConnectorTransferResults,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.parallel_state import (
@@ -23,14 +24,21 @@ from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
+    MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
 from vllm_ascend.core.kv_cache_placement import map_kvpp_layers_to_owners
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.layout import (
+    FUSED_MLA_PROTOCOL_VERSION,
+    block_is_contiguous,
+    describe_layer_layout,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
     MooncakeTransferMetadata,
@@ -165,7 +173,10 @@ class MooncakeBaseConnectorWorker:
         apart. A packed layout must place every view's first block inside one
         common page stride and use the same physical block count and stride.
         """
-        if not caches or len({tensor_storage_key(cache) for cache in caches}) != 1:
+        # A lone fused view does not own the gap to the next physical page.
+        if len(caches) < 2 or len({tensor_storage_key(cache) for cache in caches}) != 1:
+            return None
+        if not all(block_is_contiguous(cache) for cache in caches):
             return None
 
         tensor_num_blocks = {cache.shape[0] for cache in caches}
@@ -180,6 +191,13 @@ class MooncakeBaseConnectorWorker:
 
         page_base_addr = min(cache.data_ptr() for cache in caches)
         block_lens = [math.prod(cache.shape[1:]) * cache.element_size() for cache in caches]
+        # Merge only an exact, contiguous union of component payloads. Sharing
+        # a storage/stride does not grant ownership of padding or other layers.
+        payload_end = page_base_addr
+        for cache, block_len in sorted(zip(caches, block_lens), key=lambda item: item[0].data_ptr()):
+            if cache.data_ptr() != payload_end:
+                return None
+            payload_end += block_len
         if any(
             cache.data_ptr() - page_base_addr + block_len > page_stride for cache, block_len in zip(caches, block_lens)
         ):
@@ -188,7 +206,7 @@ class MooncakeBaseConnectorWorker:
         storage = caches[0].untyped_storage()
         storage_base_addr = storage.data_ptr()
         storage_end_addr = storage_base_addr + storage.nbytes()
-        if page_base_addr < storage_base_addr or page_base_addr + num_tensor_blocks * page_stride > storage_end_addr:
+        if page_base_addr < storage_base_addr or payload_end + (num_tensor_blocks - 1) * page_stride > storage_end_addr:
             return None
 
         selected_cache = max(
@@ -207,6 +225,8 @@ class MooncakeBaseConnectorWorker:
         kv_caches: dict[str, torch.Tensor | list[torch.Tensor]],
     ) -> None:
         """Register configured KV cache allocations and publish metadata."""
+        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA and self.ascend_config.kvpp_config.size > 1:
+            raise ValueError("Fused MLA PD does not support KV parallel placement")
         self.num_blocks = self.kv_cache_config.num_blocks
         logger.info("num_blocks: %s", self.num_blocks)
         self.kv_caches = kv_caches
@@ -225,6 +245,7 @@ class MooncakeBaseConnectorWorker:
         block_lens_per_layer: list[list[int]] = []
         block_shapes_per_layer: list[list[tuple[int, ...]]] = []
         block_size_scales_per_layer: list[list[int]] = []
+        layer_layouts = []
         configured_layer_names: set[str] = set()
 
         for tensor_config in self.kv_cache_config.kv_cache_tensors:
@@ -254,6 +275,12 @@ class MooncakeBaseConnectorWorker:
                 spec_index = self.layer_name_to_spec_index[layer_name]
                 spec = self.kv_cache_specs[spec_index]
                 caches = as_kv_cache_tensors(cache_or_caches)
+                if any(not block_is_contiguous(cache) for cache in caches):
+                    raise ValueError(f"Mooncake requires contiguous payloads inside each block for {layer_name!r}")
+                layout_kind = type(spec).__name__
+                if isinstance(spec, MambaSpec):
+                    layout_kind += f":{spec.mamba_type}"
+                layer_layouts.append(describe_layer_layout(layout_kind, caches))
                 shared_page_metadata = (
                     self._get_shared_page_metadata(caches)
                     if isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
@@ -263,7 +290,7 @@ class MooncakeBaseConnectorWorker:
                     page_base_addr, page_stride, block_shape, block_size_scale = shared_page_metadata
                     base_addrs.append(page_base_addr)
                     block_strides.append(page_stride)
-                    block_lens.append(page_stride)
+                    block_lens.append(sum(math.prod(cache.shape[1:]) * cache.element_size() for cache in caches))
                     block_shapes.append(block_shape)
                     block_size_scales.append(block_size_scale)
                 else:
@@ -316,6 +343,8 @@ class MooncakeBaseConnectorWorker:
             block_size_scales=block_size_scales_per_layer,
             local_ip=self.side_channel_host,
             handshake_port=self.handshake_port,
+            fused_mla_protocol=FUSED_MLA_PROTOCOL_VERSION if envs.VLLM_ASCEND_ENABLE_FLASH_MLA else 0,
+            layer_layouts=layer_layouts,
         )
         self.transfer_metadata = transfer_metadata
         self.xfer_handshake_metadata = transfer_metadata
@@ -339,6 +368,9 @@ class MooncakeBaseConnectorWorker:
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         """Return requests with completed receive and send operations."""
+        raise NotImplementedError
+
+    def get_transfer_results(self) -> KVConnectorTransferResults:
         raise NotImplementedError
 
     def get_block_ids_with_load_errors(self) -> set[int]:

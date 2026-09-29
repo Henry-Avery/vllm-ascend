@@ -22,6 +22,24 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
+from vllm_ascend import envs
+
+
+def supports_flashmla_pd(vllm_config: VllmConfig) -> bool:
+    """Keep fused MLA on both ends of the initial homogeneous pull protocol."""
+    transfer = vllm_config.kv_transfer_config
+    if transfer is None:
+        return True
+    parallel = vllm_config.parallel_config
+    return (
+        envs.VLLM_ASCEND_ENABLE_FLASH_MLA
+        and transfer.kv_connector in {"MooncakeConnectorV2", "MooncakePullConnector"}
+        and getattr(transfer, "kv_connector_module_path", None) is None
+        and parallel.prefill_context_parallel_size == 1
+        and parallel.decode_context_parallel_size == 1
+        and vllm_config.speculative_config is None
+    )
+
 
 def get_kv_cache_compression_ratio(kv_cache_spec: KVCacheSpec) -> int:
     """Return the MLA compression ratio across vLLM cache-spec APIs."""

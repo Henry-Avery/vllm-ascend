@@ -4899,6 +4899,8 @@ class NPUModelRunner(GPUModelRunner):
             return False
         if not kv_cache_spec.supports_single_raw_backing:
             return False
+        if self.vllm_config.kv_transfer_config is not None and ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            raise ValueError("External FlashMLA PD requires Model Runner V2")
         # Runtime-only exclusions do not need the static forward context. In
         # particular, sparse layerwise tests synthesize a runner without it.
         if (

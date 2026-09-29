@@ -221,6 +221,7 @@ def api():
         # external clear helper so failures are behavioral, not missing names.
         "clear_ssm_states": lambda state, flags: state.masked_fill_(~flags[:, None, None, None], 0),
     }
+    _load_functions("vllm_ascend/core/kv_cache_interface.py", ["supports_flashmla_pd"], namespace)
     _load_functions(
         "vllm_ascend/worker/utils.py",
         [
