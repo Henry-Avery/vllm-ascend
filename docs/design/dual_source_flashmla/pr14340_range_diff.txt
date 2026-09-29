@@ -1,0 +1,6 @@
+1:  500d09898 ! 1:  7db8faa46 [Feature][KV Cache] Support non-contiguous KV cache in hybrid models like Qwen3.5 and GQA models
+2:  6b2ced5a1 = 2:  3074a7bd5 [Ops][GDN] Replace GDN custom ops with fla_npu AscendC operators
+3:  9dc921425 = 3:  03a3b7171 [Feature][KV Cache] Add debug logs for non-contiguous KV cache
+4:  0c9e39333 = 4:  d54d535ef perf(gdn): optimize strided SSM state access
+5:  6663c62c0 ! 5:  51cc3b011 feat(mrv2): support non-contiguous hybrid and GQA KV cache
+6:  582a4e53d = 6:  e86c73572 [CI][BugFix] Install FLA NPU for selected tests

@@ -18,6 +18,7 @@
 #
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import replace
 from functools import partial
 from typing import Any
 
@@ -50,6 +51,7 @@ from vllm_ascend.compilation.updatable_graph import (
     UpdatableGraph,
 )
 from vllm_ascend.utils import use_updatable_graph
+from vllm_ascend.worker.v2.attn_utils import flashmla_metadata_scope
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.utils import communicator_switch
 
@@ -162,6 +164,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         )
         self.breakable_cg_runner: BreakableACLGraphWrapper | None = None
         self.model_runner = model_runner
+        self.flashmla_has_prefill = False
         self.update_stream = self.model_runner.update_stream
         self.capture_sizes = collect_sorted_captured_token_sizes(self._capture_descs)
         if super().needs_capture():
@@ -171,6 +174,14 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         if self.breakable_cg_runner is None:
             self.breakable_cg_runner = BreakableACLGraphWrapper(model, self.vllm_config)
 
+    def dispatch(self, num_reqs: int, num_tokens: int, *args, **kwargs) -> BatchExecutionDescriptor:
+        desc = super().dispatch(num_reqs, num_tokens, *args, **kwargs)
+        if self.flashmla_has_prefill and desc.cg_mode == CUDAGraphMode.FULL:
+            # A short prompt suffix can match a decode graph by length. Its
+            # captured FlashMLA operations cannot execute the FIA prefill path.
+            return replace(desc, cg_mode=CUDAGraphMode.NONE, num_tokens=num_tokens, num_reqs=num_reqs)
+        return desc
+
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
@@ -178,7 +189,6 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         with set_current_vllm_config(self.vllm_config):
             attn_backend = _get_graph_update_backend(self.model_runner.attn_groups)
         attn_metadata = self.model_runner.model_state.attn_metadata
-
         if use_updatable_graph(attn_backend):
             return self._updatable_graph_replay(desc, attn_metadata)
         else:
@@ -256,7 +266,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 _prepare_pcp_inputs_to_capture,
                 pcp_manager=pcp_manager,
             )
-        with communicator_switch():
+        with communicator_switch(), flashmla_metadata_scope(attn_groups, self.model_runner.flashmla_executor):
             return super().capture(
                 model,
                 model_state,
