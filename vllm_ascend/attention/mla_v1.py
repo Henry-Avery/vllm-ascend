@@ -1530,7 +1530,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 merged_out, merged_lse = torch_npu.npu_attention_update(
                     (previous_lse.reshape(-1), chunk_lse.reshape(-1)),
                     (previous_out.reshape(-1, D), chunk_out.reshape(-1, D)),
-                    0,
+                    1,
                 )
                 if indices is None:
                     prefix_output = merged_out.view(num_tokens, H, D)

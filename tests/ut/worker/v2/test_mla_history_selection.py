@@ -55,6 +55,7 @@ def test_history_merge_matches_dense_reference_and_skips_empty_rows(histories, r
             initial_lse.append(lse)
             expected.append(attend(q[start + j, 0], qp[start + j, 0], kv[i][: h + j + 1])[0])
     calls = []
+    merge_modes = []
 
     def fia(query, keys, values, **kwargs):
         outputs, lses = [], []
@@ -73,10 +74,12 @@ def test_history_merge_matches_dense_reference_and_skips_empty_rows(histories, r
             qs, ks = qe, ke
         return torch.cat(outputs), torch.cat(lses)
 
-    def merge(lses, outputs, _):
+    def merge(lses, outputs, mode):
+        assert mode in (0, 1)
+        merge_modes.append(mode)
         log_z = torch.logsumexp(torch.stack(lses), 0)
         out = sum(torch.exp(lse - log_z)[:, None] * value for lse, value in zip(lses, outputs))
-        return out, log_z
+        return out, log_z if mode == 1 else None
 
     def load(latent_cache, position_cache, block_table, lengths, starts, *, key, value):
         latent, position = [], []
@@ -114,6 +117,8 @@ def test_history_merge_matches_dense_reference_and_skips_empty_rows(histories, r
     )
     torch.testing.assert_close(result[:, 0], torch.stack(expected), rtol=1e-5, atol=1e-6)
     assert all(qn > 0 and kn > 0 for qn, kn in calls)
+    if any(histories):
+        assert merge_modes and set(merge_modes) == {1}
     if any(0 in lengths and sum(lengths) > 0 for lengths in chunk_lengths):
         # Without selection, the same production method consumes poisoned FIA
         # rows. This control shows the test would detect the prior behavior.
