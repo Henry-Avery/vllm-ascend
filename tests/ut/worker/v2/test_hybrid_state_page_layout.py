@@ -61,7 +61,7 @@ def test_writer_to_external_reader_keeps_shared_backing_across_kda_updates(api, 
         dtype=torch.bfloat16,
         model_version=None,
         indexes_kv_by_block_stride=False,
-        num_heads=12,
+        num_query_heads=12,
     )
     groups = [
         SimpleNamespace(layer_names=[name], kv_cache_spec=spec)
@@ -372,7 +372,7 @@ def test_production_allocator_and_reshape_select_pool_layout(api, kernel_block_s
         dtype=torch.bfloat16,
         model_version=None,
         indexes_kv_by_block_stride=False,
-        num_heads=12,
+        num_query_heads=12,
     )
     groups = [
         SimpleNamespace(layer_names=[name], kv_cache_spec=layer_spec)
@@ -411,7 +411,7 @@ def test_allocator_multiple_layers_preserves_shared_aliases_and_layer_offsets(ap
         dtype=torch.bfloat16,
         model_version=None,
         indexes_kv_by_block_stride=False,
-        num_heads=12,
+        num_query_heads=12,
     )
     layer_bytes = 5 * 64
     groups = [
@@ -452,7 +452,7 @@ def test_mla_reshape_rejects_fractional_or_overlapping_kernel_pages(api, manager
         dtype=torch.bfloat16,
         model_version=None,
         indexes_kv_by_block_stride=False,
-        num_heads=12,
+        num_query_heads=12,
     )
     group = SimpleNamespace(layer_names=["mla"], kv_cache_spec=spec, kv_cache_group_id=0)
     config = SimpleNamespace(num_blocks=5, kv_cache_groups=[group])

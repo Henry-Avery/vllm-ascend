@@ -1,7 +1,9 @@
 # Fixed dual-source cache and external FlashMLA candidate
 
-This independent candidate leaves PR 13 fixed at
-`b4af8712a4d08e424ca0729acc11e9fe667c44fc`. It is a Draft for code review;
+This independent candidate appends the complete descriptor correction from
+PR 13 `93dbf8f91c0ca3d94e5617b0a1903b0456edc40a` to PR 15
+`d843e2e5d865926ba27c6d3222993b61db48380f`, without merging PR 13 history.
+The two upstream source heads and PR base remain fixed. It is a Draft for code review;
 no NPU serving, installation, deployment or automation was changed.
 Local CPU checks do not establish a runtime NaN fix.
 
@@ -61,7 +63,7 @@ reviewable before that integration.
 
 | Stage | Plan-1 behavior examined | Candidate decision and remaining evidence |
 | --- | --- | --- |
-| Allocation / physical pages | Shared descriptor-backed allocation, per-layer/page offsets, manager/kernel splitting; newer 2D BLHNC/LBHNC helper | Keep the dual-source allocator and page-major Mamba state views. Do not import the plan-1 allocator or assume its newer `create_kv_cache_views` API. Arithmetic row strides and bounds/alignment checks retain nonzero raw offsets. 25 CPU regressions cover physical intervals, padding, aliases and split ratios. |
+| Allocation / physical pages | Shared descriptor-backed allocation, per-layer/page offsets, manager/kernel splitting; newer 2D BLHNC/LBHNC helper | The initial review missed the actual spec/planner entry and plan-1 descriptor raw-view branch. The follow-up separates query metadata from KV geometry, allocates descriptor-strided byte rows, retains Mamba manager pitch and maps MLA kernel subpages with plan-1 ownership/offset semantics. It does not import the newer `create_kv_cache_views` API. Actual paired planner tests now cover BLHNC/LBHNC/LBNHC and ratios 1/3/6. |
 | Persistent MLA writer | Writes the same durable pool later read by attention; native Flash route can use fused state copy / scatter | Retain PR 16456's final writer. K3 `_exec_kv_no_rope` passes zero-copy latent/positional component views to `DeviceOperator.reshape_and_cache`. The external decode reader receives the original fused BBND view. No replacement cache or whole-pool normalization is introduced. New device seam checks written values. |
 | KDA convolution | Separate Flash conv route and native state stride support | Retain FLA NPU wrappers from the two-source baseline. Original state descriptor is forwarded; the pinned native conv source handles first-axis/state strides. Do not import older PR 10 conv workarounds or plan-1's extra operators. Device equivalence remains pending. |
 | KDA recurrent | Native recurrence receives cache stride and aliases final state | Existing AscendC adapter, tiling and both kernels address actual first-axis stride. No recurrent math change. New NPU seam updates state between MLA write and decode read. |
@@ -100,7 +102,39 @@ No device `item()` or CPU tensor-content inspection is added to the decode
 hot path. The existing flags are centralized in `envs.py`, default off and
 documented; architectural/env review is still part of reviewing this Draft.
 
-## Validation status
+## Descriptor follow-up and current validation
+
+The two independent corrections are documented in
+[the source repair analysis](../pr13_descriptor_startup_fix.md).
+The cache spec now uses `num_query_heads`; inherited `num_heads` remains KV
+geometry through merge and V1/V2 construction. The allocator preserves legal
+manager/layer strides, and MLA splitting divides only the within-manager
+layer offset, never the allocation-base offset. KDA states retain their manager
+pitch. Writer, reader, copy and zero consume these final views. No cache bytes
+are moved to normalize the pool.
+
+The PR 15-specific writer/reader CPU fixture also needed its obsolete
+`num_heads=12` spec argument renamed; attention layer query-head parameters
+keep their original meaning. The current selected-kernel-size adaptation,
+MLA/non-SFA quantization guard and all phase/device seam tests are retained.
+
+Local follow-up results: **62 cache tests + 2 phase tests passed**, and
+**44 FlashMLA contract/lifecycle tests passed**. Paired-source CPU zeroer
+assembly smoke also passed (offset64, ratios1/3, payload-only protection);
+all-file formatting passed. The cache suite includes
+the original slot-3/MLA-page-174 incident, exact publisher LBNHC values,
+real spec/merge/planner, three layouts, ratios 1/3/6, KDA updates preserving
+live MLA pages, backing offsets and payload-only copy/zero. CPU launches
+remain explicit substitutes. Full-runtime `test_device_metadata.py` could
+not collect because this environment has no installed `vllm`; the old
+14-check result below is historical, not a newly repeated runtime check.
+
+Device acceptance is **not run**. The existing NPU seam constructs dense
+per-layer descriptors; it must not be presented as real device coverage of
+all block-outer layouts. Follow the [publisher handoff](publisher_handoff.md)
+for exact startup, actual descriptor isolation and numerical gates.
+
+## Initial d843 validation record (historical)
 
 Local environment: macOS CPU, Python 3.12, torch 2.8.0. No complete paired
 vLLM runtime, `torch_npu` or NPU is installed in this worktree.
@@ -198,5 +232,5 @@ After eager passes, test graph padding/empty rows, stable addresses, event
 fences, replay, zero-history/LSE and speculative paths separately. Benchmark
 without trace/dump overhead; record JIT warmup, COW snapshot peak allocation,
 latency and throughput. This run sheet neither deploys code nor transfers
-publisher ownership. Keep old PR 10 incident, PR 13 deployment and this new
+publisher ownership. Keep old PR 10 incident, PR 13 control and this new
 candidate's results separate.

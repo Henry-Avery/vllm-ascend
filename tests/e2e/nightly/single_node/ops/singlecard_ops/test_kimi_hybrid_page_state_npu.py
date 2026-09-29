@@ -46,7 +46,7 @@ def _allocate_hybrid(monkeypatch, manager_block_size):
         block_size=manager_block_size,
         num_kv_heads=1,
         head_size=576,
-        num_heads=HEADS,
+        num_query_heads=HEADS,
         dtype=torch.bfloat16,
         page_size_padded=page_bytes,
     )
