@@ -81,6 +81,7 @@ from vllm_ascend.worker.kvpp_cache import allocate_kvpp_cache
 from vllm_ascend.worker.utils import (
     get_single_raw_mla_backing,
     make_page_strided_cache_view,
+    row_major_strides,
 )
 
 if TYPE_CHECKING:
@@ -524,26 +525,26 @@ def _adjust_dsv4_kv_layout(
     page_size_bytes: int,
     overlap_full_kv_cache: bool = False,
 ) -> list[torch.Tensor]:
+    if raw_tensor.element_size() != 1 or not raw_tensor.is_contiguous():
+        raise ValueError("Page views require a contiguous raw byte allocation.")
+    if page_size_bytes <= 0 or len(cache_shapes) != len(cache_dtypes):
+        raise ValueError("Page views require a positive page size and matching shapes/dtypes.")
     caches = []
-    base_offset_bytes = raw_tensor.storage_offset() * raw_tensor.element_size()
-    offset_bytes = base_offset_bytes
+    offset_bytes = 0
     for index, (shape, dtype) in enumerate(zip(cache_shapes, cache_dtypes)):
         if overlap_full_kv_cache and index == 2:
-            offset_bytes = base_offset_bytes
+            offset_bytes = 0
         dtype_size = get_dtype_size(dtype)
-        page_stride = page_size_bytes // dtype_size
-        stride = torch.empty(shape).stride()
-        if offset_bytes % dtype_size:
-            raise ValueError(f"DSA cache offset {offset_bytes} is not aligned to {dtype}.")
-        caches.append(
-            torch.as_strided(
-                raw_tensor.view(dtype),
-                size=shape,
-                stride=(page_stride, *stride[1:]),
-                storage_offset=offset_bytes // dtype_size,
-            )
-        )
-        offset_bytes += stride[0] * dtype_size
+        stride = row_major_strides(shape)
+        if page_size_bytes % dtype_size or (raw_tensor.storage_offset() + offset_bytes) % dtype_size:
+            raise ValueError(f"Cache page/offset is not aligned to {dtype}.")
+        payload_bytes = stride[0] * dtype_size
+        if offset_bytes + payload_bytes > page_size_bytes:
+            raise ValueError("Cache payloads exceed their physical page.")
+        if shape[0] and (shape[0] - 1) * page_size_bytes + offset_bytes + payload_bytes > raw_tensor.numel():
+            raise ValueError("Cache page view exceeds its raw allocation.")
+        caches.append(make_page_strided_cache_view(raw_tensor, shape, dtype, page_size_bytes, offset_bytes))
+        offset_bytes += payload_bytes
     return caches
 
 
@@ -899,7 +900,7 @@ def _allocate_kv_cache(
                 layer_size = kv_cache_config.num_blocks * layer_spec.page_size_bytes
                 start = kv_cache_tensor.offset + layer_idx * kv_cache_tensor.layer_stride
                 end = start + layer_size
-                if end > hybrid_backing.numel():
+                if start < 0 or end > hybrid_backing.numel():
                     raise ValueError(f"Hybrid KV cache view for {layer_name} exceeds the backing allocation.")
                 kv_cache_raw_tensors[layer_name] = hybrid_backing[start:end]
             continue
@@ -921,7 +922,7 @@ def _allocate_kv_cache(
                     )
                 start = kv_cache_tensor.offset + layer_idx * kv_cache_tensor.layer_stride
                 end = start + layer_size
-                if end > hybrid_backing.numel():
+                if start < 0 or end > hybrid_backing.numel():
                     raise ValueError(f"Hybrid KV cache view for {layer_name} exceeds the backing allocation.")
                 kv_cache_raw_tensors[layer_name] = hybrid_backing[start:end]
             continue
@@ -1296,7 +1297,11 @@ def _reshape_kv_cache_v2(
             single_raw_mla_cache = get_single_raw_mla_backing(raw_cache)
 
             if single_raw_mla_cache is not None and _uses_single_raw_mla_cache(vllm_config, layer_name, kv_cache_spec):
+                if kv_cache_spec.block_size % kernel_block_size:
+                    raise ValueError("MLA manager blocks must contain whole kernel blocks.")
                 kernel_blocks_per_manager = kv_cache_spec.block_size // kernel_block_size
+                if kv_cache_spec.page_size_bytes % kernel_blocks_per_manager:
+                    raise ValueError("MLA physical pages must split into whole kernel pages.")
                 slot_bytes = kv_cache_spec.page_size_bytes // kernel_blocks_per_manager
                 component_shape = (
                     kv_cache_config.num_blocks * kernel_blocks_per_manager,
@@ -1305,6 +1310,10 @@ def _reshape_kv_cache_v2(
                 )
                 nope_dim, rope_dim = _get_attention_kv_cache_dims(layer_name, kv_cache_spec)
                 fused_dim = nope_dim + rope_dim
+                dtype_size = get_dtype_size(kv_cache_spec.dtype)
+                payload_bytes = kernel_block_size * kv_cache_spec.num_kv_heads * fused_dim * dtype_size
+                if slot_bytes % dtype_size or payload_bytes > slot_bytes:
+                    raise ValueError("MLA kernel payload must fit in an aligned physical kernel page.")
 
                 if (
                     get_current_hardware_profile().supports(HardwareCapability.MLA_FLASH)
