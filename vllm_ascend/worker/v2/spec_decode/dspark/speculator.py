@@ -283,8 +283,15 @@ class AscendDSparkSpeculator(DSparkSpeculator):
             # TODO: Remove this guard once main2main includes upstream vLLM
             # #54856 (facd9a74a1), which resets the profiling DP counts.
             sync_state = None
+        # Initial memory profiling invokes the drafter before set_attn creates
+        # its draft builders. Keep real runs bound to those builders.
+        attn_groups = getattr(self, "attn_groups", None)
+        if attn_groups is None:
+            if not (dummy_run and is_profile and skip_attn_for_dummy_run):
+                raise RuntimeError("DSpark attention groups are unavailable outside initial memory profiling")
+            attn_groups = ()
         with (
-            flashmla_metadata_scope(self.attn_groups, self.flashmla_executor),
+            flashmla_metadata_scope(attn_groups, self.flashmla_executor),
             build_attn_metadata_wrapper(),
             build_attn_metadata_factory(
                 self.input_buffers.positions,
