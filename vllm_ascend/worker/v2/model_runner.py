@@ -26,6 +26,7 @@ from vllm.compilation import breakable_cudagraph
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import async_tensor_h2d as async_copy_to_gpu
@@ -323,6 +324,11 @@ class NPUModelRunner(GPUModelRunner):
             static_forward_context=self.compilation_config.static_forward_context,
         )
         self.model_state.kvpp_runtime = self.kvpp
+        if self.vllm_config.additional_config.get("bline_diagnostics", {}).get("enabled", False):
+            # Lazy diagnostic-only loading; disabled serving installs no hooks.
+            from vllm_ascend.worker.v2.bline_diagnostics import install_bline_diagnostics
+
+            install_bline_diagnostics(self, get_forward_context)
 
     @torch.inference_mode()
     def execute_model(

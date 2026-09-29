@@ -234,3 +234,44 @@ without trace/dump overhead; record JIT warmup, COW snapshot peak allocation,
 latency and throughput. This run sheet neither deploys code nor transfers
 publisher ownership. Keep old PR 10 incident, PR 13 control and this new
 candidate's results separate.
+
+## Executable B-line diagnostics follow-up
+
+The next append adds a default-off `additional_config.bline_diagnostics`
+service probe and `tools/bline/validate.py` (reduced-layer plan, binary
+manifest, rank-complete log summary). See the expanded
+[publisher handoff](publisher_handoff.md#5-可执行-b-线减层诊断本次新增).
+This is bounded V2 eager DP1/PP1/CP1/no-spec diagnostics, not a device result.
+No environment variables or global mutable probe state are introduced.
+Disabled serving installs no wrappers; synchronization and payload snapshots
+exist only in the enabled diagnostic path. Model-runner integration occurs
+once after cache binding; instance hooks capture real request order and both
+ordinary and lmhead-TP raw logits before grammar/sampling. Batch sharding is
+explicitly unsupported.
+
+Actual KDA conv/chunk/recurrent calls protect only valid MLA history selected
+by live metadata, planner manager/kernel ratios and group ownership. Checks
+compare exact bytes and detect finite corruption; no whole-cache contiguous
+normalization is used. K3 writer readback uses its actual normalized outputs.
+Eager FIA/external projected attention and valid final-hidden/raw-logits rows
+have finite checks. Fused alternate writers, independent attention numerical
+reference, masked LSE, non-target writer protection and whole-model accuracy
+remain outside this probe's current coverage. Missing routes or budgets cannot
+produce PASS. Cold prefill has no protection evidence; later history-backed
+prefill and decode are required. DP4 final stress must disable this DP1 probe.
+
+CPU self-tests include isolated old state-major finite corruption, fixed-view
+protection, real planner layout/ratio/offset combinations, effective chunk
+keep indices, writer mismatch, raw nonfinite values, padding exclusion,
+dummy/profile budgets, complete instance-hook serving flow and rank/step/log
+completeness. Actual installed vLLM ModelConfig planning, NPU/service execution,
+real-weight reduced layers and full-model stress remain publisher gates.
+
+Local validation of this append: **27 probe self-tests + 62 cache tests +
+2 phase tests = 91 passed**, **44 FlashMLA tests passed**. Direct publisher
+CLI `--help` execution passed (the tool lives below `tools/bline` to avoid
+`tools/bisect` shadowing the Python standard library). Complete fake-runner
+hooks cover cold prefill, history prefill and decode, ordinary/padded LM-head
+sampling, and restoration. These results use CPU launches/fake serving,
+not an installed paired vLLM/NPU service. The actual ModelConfig plan and
+binary manifest must still be generated on the publisher.
