@@ -267,7 +267,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             ratio_kwargs: dict[str, Any] = {"tokens_per_state": compression_ratio}
             spec = AscendMLAAttentionSpec(
                 block_size=spec.block_size,
-                num_heads=attn_module.num_heads,
+                num_query_heads=attn_module.num_heads,
                 num_kv_heads=spec.num_kv_heads,
                 head_size=head_size,
                 dtype=dtype,
@@ -1472,7 +1472,7 @@ def _reshape_kv_cache_v2(
 
                 if (
                     get_current_hardware_profile().supports(HardwareCapability.MLA_FLASH)
-                    and kv_cache_spec.num_heads in MLA_FLASH_SUPPORTED_Q_HEADS
+                    and kv_cache_spec.num_query_heads in MLA_FLASH_SUPPORTED_Q_HEADS
                 ):
                     # Preserve the V1 A5 protocol: one token-fused tensor with
                     # [nope | rope] in the trailing 576 lanes of every token.
