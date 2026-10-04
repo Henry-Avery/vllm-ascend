@@ -1755,6 +1755,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertEqual(spec.model_version, attn_module.model_version)
         self.assertTrue(spec.indexes_kv_by_block_stride)
         self.assertEqual(spec.num_query_heads, 64)
+        self.assertEqual(spec.num_heads, 1)
 
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")

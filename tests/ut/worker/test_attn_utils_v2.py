@@ -1743,6 +1743,8 @@ def test_attn_state_mla_spec_and_metadata_wrappers(monkeypatch):
     assert specs["fa"].head_size == 128
     assert specs["fa"].num_query_heads == 64
     assert specs["sfa"].num_query_heads == 64
+    assert specs["fa"].num_heads == 1
+    assert specs["sfa"].num_heads == 1
     assert specs["sfa"].cache_sparse_sfa_c8 is True
 
     mla_spec = AscendMLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)
