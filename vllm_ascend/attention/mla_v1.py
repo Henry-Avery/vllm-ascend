@@ -1006,8 +1006,6 @@ class AscendMLAImpl(MLAAttentionImpl):
             raise ValueError("External FlashMLA integration requires unquantized BF16/FP16 BBND cache")
         if self.pcp_enabled or config.parallel_config.decode_context_parallel_size != 1:
             raise ValueError("External FlashMLA currently requires PCP=1 and DCP=1; distributed adaptation is separate")
-        if config.kv_transfer_config is not None:
-            raise ValueError("External FlashMLA with fused BBND cache requires colocated serving without KV transfer")
 
     @staticmethod
     def update_graph_params(

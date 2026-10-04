@@ -65,7 +65,7 @@ def test_disabled_scope_does_not_inspect_uninitialized_builders():
         ({"use_v2_model_runner": False}, "model runner V2"),
         ({"speculative_config": SimpleNamespace(method="mtp")}, "DSpark only"),
         ({"speculative_config": SimpleNamespace(method="dspark")}, None),
-        ({"kv_transfer_config": object()}, "without KV transfer"),
+        ({"kv_transfer_config": object()}, None),
         ({"decode_context_parallel_size": 2}, "DCP=1"),
         ({"enable_kv_nz": True}, "BBND"),
         ({"num_kv_heads": 2}, "one KV head"),
