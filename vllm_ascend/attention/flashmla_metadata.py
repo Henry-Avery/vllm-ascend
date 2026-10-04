@@ -9,6 +9,7 @@ Meta implementation and the existing executor. It never owns persistent KV.
 from dataclasses import dataclass, replace
 
 import torch
+from vllm.logger import logger
 
 from vllm_ascend.attention.flashmla import (
     FLASHMLA_QK_DIM,
@@ -51,6 +52,7 @@ class FlashMLAMetadataBuilder:
         self.defer = False
         self.executor: DeviceMetadataExecutor | None = None
         self.tasks: tuple[DeviceMetadataTask, ...] = ()
+        self._refresh_logged: set[bool] = set()
 
     def _allocate(self, tokens: int, rows: int, columns: int, causal: bool) -> FlashMLADecode:
         ints = {"dtype": torch.int32, "device": self.device}
@@ -135,6 +137,15 @@ class FlashMLAMetadataBuilder:
                 flash.cos.copy_(cos)
                 flash.sin.copy_(sin)
             flash.schedule.copy_(flash.adapter.build_metadata(flash.cache_lens, flash.cu, flash.used_q))
+            if common.causal not in self._refresh_logged:
+                logger.info_once(
+                    "[FlashMLA] device metadata refresh queued: causal=%s, device=%s. "
+                    "The metadata operator returned and a copy into the caller-owned schedule was queued.",
+                    common.causal,
+                    str(self.device),
+                    scope="process",
+                )
+                self._refresh_logged.add(common.causal)
 
         self.tasks = (DeviceMetadataTask(DeviceMetadataStage.ATTENTION, refresh, id(flash.schedule)),)
         if not self.defer:

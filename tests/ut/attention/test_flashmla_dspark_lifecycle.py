@@ -6,6 +6,8 @@ import ast
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import MethodType, SimpleNamespace
+from typing import Any, cast
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -72,6 +74,52 @@ def test_draft_capture_binds_and_releases_only_its_metadata_executor(enabled, fa
         speculator.capture()
     assert state.executor is None and not state.defer
     assert released == ([True] if enabled else [])
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_draft_startup_checkpoint_follows_attention_setup(enabled):
+    logger = Mock()
+    state = object() if enabled else None
+    groups = [[SimpleNamespace(get_metadata_builder=lambda _: SimpleNamespace(flashmla_state=state))]]
+    backend = type("MLABackend", (), {})
+
+    class Parent:
+        def set_attn(self, *args):
+            self.attn_groups = groups
+            self._context_slot_mappings = torch.zeros(1, dtype=torch.int64)
+            self.draft_attn_layer_names = {"draft"}
+
+    cls = load_class(
+        SPECULATOR,
+        "AscendDSparkSpeculator",
+        ["set_attn"],
+        dict(
+            torch=torch,
+            logger=logger,
+            cast=cast,
+            Any=Any,
+            AttentionLayerBase=object,
+            set_current_vllm_config=lambda _: nullcontext(),
+            get_layers_from_vllm_config=lambda *args: {"draft": SimpleNamespace(get_attn_backend=lambda: backend)},
+            _get_graph_update_backend=lambda _: backend,
+            AscendMLABackend=backend,
+            AscendAttentionBackend=type("GQABackend", (), {}),
+            dflash_speculator=SimpleNamespace(),
+            prepare_dflash_inputs_factory=lambda _: object(),
+        ),
+        Parent,
+    )
+    speculator = cls()
+    speculator.flashmla_executor = object() if enabled else None
+    speculator.vllm_config = speculator.attn_vllm_config = SimpleNamespace(cache_config=SimpleNamespace(block_size=128))
+    config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=["target", "draft"])])
+    speculator.set_attn(None, config, None, None, None)
+    assert speculator.attn_architecture == "MLA"
+    if enabled:
+        logger.info_once.assert_called_once()
+        assert logger.info_once.call_args.args[1:] == ("MLA", 1)
+    else:
+        logger.info_once.assert_not_called()
 
 
 @pytest.mark.parametrize("enabled", [False, True])

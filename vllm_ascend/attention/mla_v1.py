@@ -986,6 +986,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self._mlapo_uses_native_weights = False
         if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
             self._validate_external_flashmla()
+            self._flashmla_logged_modes: set[tuple[bool, bool]] = set()
 
     def _validate_external_flashmla(self) -> None:
         config = self.vllm_config
@@ -2031,6 +2032,23 @@ class AscendMLAImpl(MLAAttentionImpl):
             metadata=flash.schedule,
             attn_mask=flash.attn_mask,
         )
+        mode = (_EXTRA_CTX.is_draft_model, _EXTRA_CTX.capturing)
+        if mode not in self._flashmla_logged_modes:
+            logger.info_once(
+                "[FlashMLA] attention dispatch returned: role=%s, phase=%s, mask_mode=%d, "
+                "q_shape=%s, cache_shape=%s, cache_stride=%s, device=%s. "
+                "This is a host dispatch checkpoint; graph replay bypasses Python. "
+                "Use an NPU profiler to confirm device execution and replay.",
+                "draft" if mode[0] else "target",
+                "capture" if mode[1] else "eager/warmup",
+                flash.adapter.config.mask_mode,
+                tuple(flash.query.shape),
+                tuple(fused_cache.shape),
+                fused_cache.stride(),
+                str(fused_cache.device),
+                scope="process",
+            )
+            self._flashmla_logged_modes.add(mode)
         # Zero unused query rows even if the package leaves their output undefined.
         latent.masked_fill_(~flash.token_live[None, :, None], 0)
         return self._v_up_proj(latent)

@@ -36,6 +36,8 @@ def runtime(monkeypatch):
         "vllm.forward_context", BatchDescriptor=object, get_forward_context=Mock(), is_forward_context_available=Mock()
     )
     install("vllm_ascend")
+    logger = Mock()
+    install("vllm.logger", logger=logger)
     tree = ast.parse((root / "vllm_ascend/attention/utils.py").read_text())
     node = next(
         n
@@ -77,7 +79,9 @@ def runtime(monkeypatch):
             impl, torch.device("cpu"), max_num_reqs=4, attn_mask=masks.get_splitfuse_attn_mask()
         )
 
-    return SimpleNamespace(builder=builder, metadata=metadata, stage=task_module.DeviceMetadataStage, masks=masks)
+    return SimpleNamespace(
+        builder=builder, metadata=metadata, stage=task_module.DeviceMetadataStage, masks=masks, logger=logger
+    )
 
 
 def common(lengths, boundaries, *, tokens=4, slots=None, positions=None, blocks=None):
@@ -111,11 +115,13 @@ def test_metadata_refresh_never_reads_tensor_values_back_to_host(runtime, monkey
     builder.build(inputs, 1, 1, False)
     (task,) = builder.take_tasks()
     runtime.metadata.reset_mock()
+    runtime.logger.reset_mock()
     with monkeypatch.context() as patch:
         for method in ("cpu", "item", "tolist", "numpy", "__bool__"):
             patch.setattr(torch.Tensor, method, forbidden)
         task.run()
     runtime.metadata.assert_called_once()
+    runtime.logger.info_once.assert_called_once()
 
 
 def test_same_capacity_refreshes_new_requests_without_changing_addresses(runtime):
@@ -227,3 +233,23 @@ def test_builders_share_existing_causal_mask_without_copying_or_mutating(runtime
     second = runtime.builder().build(common([13], [0, 1]), 1, 1, False)
     assert first.attn_mask is second.attn_mask is mask
     assert torch.equal(mask, original)
+
+
+def test_refresh_checkpoint_is_bounded_per_causal_mode(runtime):
+    builder = runtime.builder()
+    for causal in (True, True, False, False):
+        inputs = common([9], [0, 1])
+        inputs.causal = causal
+        builder.build(inputs, 1, 1, False)
+    assert runtime.logger.info_once.call_count == 2
+
+
+def test_failed_metadata_operator_cannot_report_refresh_success(runtime):
+    builder = runtime.builder()
+    builder.defer = True
+    builder.build(common([9], [0, 1]), 1, 1, False)
+    (task,) = builder.take_tasks()
+    runtime.metadata.side_effect = RuntimeError("metadata launch failed")
+    with pytest.raises(RuntimeError, match="metadata launch failed"):
+        task.run()
+    runtime.logger.info_once.assert_not_called()
