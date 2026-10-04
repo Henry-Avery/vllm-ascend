@@ -23,6 +23,7 @@ import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_dcp_group
+from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -150,6 +151,19 @@ class AscendDSparkSpeculator(DSparkSpeculator):
             dflash_speculator.prepare_dflash_inputs = prepare_dflash_inputs_factory(
                 self.vllm_config.cache_config.block_size
             )
+            if self.flashmla_executor is not None:
+                flashmla_groups = sum(
+                    getattr(group.get_metadata_builder(0), "flashmla_state", None) is not None
+                    for groups in self.attn_groups
+                    for group in groups
+                )
+                logger.info_once(
+                    "[FlashMLA] DSpark attention ready: architecture=%s, external_metadata_groups=%d. "
+                    "Draft execution is confirmed separately by the role=draft dispatch checkpoint.",
+                    self.attn_architecture,
+                    flashmla_groups,
+                    scope="process",
+                )
 
     def _prepare_draft_dcp_metadata_inputs(
         self, num_reqs: int, num_reqs_padded: int, step: int

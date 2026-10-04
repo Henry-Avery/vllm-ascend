@@ -32,6 +32,9 @@ def api(monkeypatch):
     utils = ModuleType("vllm_ascend.attention.utils")
     exec(compile(ast.Module(body=[node], type_ignores=[]), "<capability>", "exec"), utils.__dict__)
     monkeypatch.setitem(sys.modules, utils.__name__, utils)
+    log_module = ModuleType("vllm.logger")
+    log_module.logger = Mock()
+    monkeypatch.setitem(sys.modules, log_module.__name__, log_module)
     return SimpleNamespace(**runpy.run_path(str(root / "vllm_ascend/attention/flashmla.py")))
 
 
@@ -187,6 +190,8 @@ def test_loader_imports_public_package_only_when_requested(api):
     importer.assert_called_once_with("cann_ops_transformer.ops")
     assert adapter.attention_op is ops.flash_mla_with_kvcache
     assert adapter.metadata_op is ops.flash_mla_with_kvcache_metadata
+    api.logger.info_once.assert_called_once()
+    assert "external operators loaded" in api.logger.info_once.call_args.args[0]
 
 
 @pytest.mark.parametrize("missing", ["package", "symbol"])
@@ -197,6 +202,7 @@ def test_missing_package_or_symbol_has_actionable_error(api, missing):
         pytest.raises(RuntimeError, match="Install a package matching"),
     ):
         api.FlashMLAAdapter.load(api.FlashMLAConfig(64, 1.0))
+    api.logger.info_once.assert_not_called()
 
 
 def test_kernel_error_propagates_without_fallback_or_retry(api, inputs):

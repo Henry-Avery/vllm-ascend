@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from importlib import import_module
 
 import torch
+from vllm.logger import logger
 
 from vllm_ascend.attention.utils import MLA_FLASH_SUPPORTED_Q_HEADS
 
@@ -123,6 +124,16 @@ class FlashMLAAdapter:
                 "and flash_mla_with_kvcache_metadata. Install a package matching the worker's "
                 "CANN and torch_npu versions; the VA private native operator is not a fallback."
             ) from exc
+        logger.info_once(
+            "[FlashMLA] external operators loaded: ops=%s, attention=%s.%s, metadata=%s.%s. "
+            "Import success does not verify NPU execution.",
+            getattr(ops, "__file__", "unknown"),
+            getattr(attention_op, "__module__", "unknown"),
+            getattr(attention_op, "__name__", type(attention_op).__name__),
+            getattr(metadata_op, "__module__", "unknown"),
+            getattr(metadata_op, "__name__", type(metadata_op).__name__),
+            scope="process",
+        )
         return cls(config, attention_op, metadata_op)
 
     def build_metadata(
