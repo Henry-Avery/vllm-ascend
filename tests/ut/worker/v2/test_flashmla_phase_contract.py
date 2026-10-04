@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU tests of actual runner sorting/graph dispatch with upstream API shells."""
+"""CPU tests of actual runner phase ordering with upstream API shells."""
 
 import ast
 from collections import namedtuple
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,7 +32,7 @@ def _class_method(path, class_name, method_name, base, namespace):
 
 
 @pytest.mark.parametrize("prompt_width", [1, 2])
-def test_runner_sorts_short_prefill_identity_before_metadata_and_disables_full_graph(prompt_width):
+def test_runner_sorts_short_prefill_identity_and_preserves_upstream_graph_selection(prompt_width):
     # Upstream supplies actual phase and heterogeneous indexed request fields.
     batch_type = namedtuple(
         "Batch",
@@ -68,7 +67,6 @@ def test_runner_sorts_short_prefill_identity_before_metadata_and_disables_full_g
     )
     runner = runner_class()
     runner.vllm_config = object()
-    runner.cudagraph_manager = SimpleNamespace(flashmla_has_prefill=False)
     reordered, uniform = runner.gather_batch_req_state(object(), False)
     assert reordered.req_ids == ["decode-a", "decode-b", "suffix", "cold"]
     for name in (
@@ -80,42 +78,13 @@ def test_runner_sorts_short_prefill_identity_before_metadata_and_disables_full_g
     ):
         np.testing.assert_array_equal(getattr(reordered, name), getattr(batch, name)[[1, 3, 0, 2]])
     assert uniform is None and reordered.has_prefill
-    assert runner.cudagraph_manager.flashmla_has_prefill
-
-    modes = SimpleNamespace(FULL="full", NONE="none")
-
-    @dataclass
-    class Descriptor:
-        cg_mode: str = modes.FULL
-        num_reqs: int = 8
-        num_tokens: int = 16
-
-    class GraphParent:
-        def dispatch(self, *_args, **_kwargs):
-            return Descriptor()
-
-    manager_class = _class_method(
-        "vllm_ascend/worker/v2/aclgraph_utils.py",
-        "ModelAclGraphManager",
-        "dispatch",
-        GraphParent,
-        dict(replace=replace, CUDAGraphMode=modes),
-    )
-    manager = manager_class()
-    manager.flashmla_has_prefill = runner.cudagraph_manager.flashmla_has_prefill
-    descriptor = manager.dispatch(len(reordered.req_ids), reordered.num_tokens)
-    assert descriptor.cg_mode == modes.NONE
-    assert (descriptor.num_reqs, descriptor.num_tokens) == (4, 2 * prompt_width + 2)
-
-    # The next pure-decode step and profiling must clear the stale phase gate.
+    # Pure decode and initial profiling preserve the parent's batch contract.
     batch = batch._replace(is_prefilling_np=np.zeros(4, dtype=bool), has_prefill=False)
-    runner.gather_batch_req_state(object(), False)
-    manager.flashmla_has_prefill = runner.cudagraph_manager.flashmla_has_prefill
-    assert manager.dispatch(4, 4).cg_mode == modes.FULL
-
+    reordered, uniform = runner.gather_batch_req_state(object(), False)
+    assert reordered.req_ids == batch.req_ids
+    assert not reordered.has_prefill
     batch = None
-    runner.gather_batch_req_state(object(), True)
-    assert not runner.cudagraph_manager.flashmla_has_prefill
+    assert runner.gather_batch_req_state(object(), True) == (None, None)
 
 
 @pytest.mark.parametrize(

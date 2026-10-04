@@ -7,19 +7,32 @@ the leaf module isolates it from the engine/plugin initialization in __init__.
 The ordinary repository UT configuration can also run these tests.
 """
 
+import ast
 import runpy
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
 
-@pytest.fixture(scope="module")
-def api():
-    path = Path(__file__).resolve().parents[3] / "vllm_ascend/attention/flashmla.py"
-    return SimpleNamespace(**runpy.run_path(str(path)))
+@pytest.fixture
+def api(monkeypatch):
+    root = Path(__file__).resolve().parents[3]
+    # Load the real shared capability constant without importing the NPU engine.
+    tree = ast.parse((root / "vllm_ascend/attention/utils.py").read_text())
+    node = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "MLA_FLASH_SUPPORTED_Q_HEADS" for t in n.targets)
+    )
+    utils = ModuleType("vllm_ascend.attention.utils")
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "<capability>", "exec"), utils.__dict__)
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+    return SimpleNamespace(**runpy.run_path(str(root / "vllm_ascend/attention/flashmla.py")))
 
 
 @pytest.fixture

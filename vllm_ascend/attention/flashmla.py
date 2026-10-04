@@ -14,13 +14,12 @@ from importlib import import_module
 
 import torch
 
+from vllm_ascend.attention.utils import MLA_FLASH_SUPPORTED_Q_HEADS
+
 FLASHMLA_QK_DIM = 576
 FLASHMLA_V_DIM = 512
 FLASHMLA_BLOCK_SIZE = 128
 FLASHMLA_MASK_SIZE = 2048
-# Match the existing MLA_FLASH capability gate after tensor parallel sharding.
-# Actual support for each count still requires an NPU operator check.
-FLASHMLA_QUERY_HEADS = (8, 12, 64, 96)
 FLASHMLA_MAX_BATCH_SIZE = 65535
 
 
@@ -66,8 +65,8 @@ class FlashMLAConfig:
     return_softmax_lse: bool = False
 
     def __post_init__(self) -> None:
-        if self.num_heads not in FLASHMLA_QUERY_HEADS:
-            raise ValueError(f"FlashMLA requires local Q heads in {FLASHMLA_QUERY_HEADS}, got {self.num_heads}")
+        if self.num_heads not in MLA_FLASH_SUPPORTED_Q_HEADS:
+            raise ValueError(f"FlashMLA requires local Q heads in {MLA_FLASH_SUPPORTED_Q_HEADS}, got {self.num_heads}")
         if self.mask_mode not in (0, 3):
             raise ValueError("FlashMLA mask_mode must be 0 or 3")
         if self.layout_kv != "PA_BBND":

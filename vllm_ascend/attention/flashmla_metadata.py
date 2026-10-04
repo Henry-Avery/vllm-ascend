@@ -11,7 +11,6 @@ from dataclasses import dataclass, replace
 import torch
 
 from vllm_ascend.attention.flashmla import (
-    FLASHMLA_MASK_SIZE,
     FLASHMLA_QK_DIM,
     FLASHMLA_V_DIM,
     FlashMLAAdapter,
@@ -40,7 +39,7 @@ class FlashMLADecode:
 
 
 class FlashMLAMetadataBuilder:
-    def __init__(self, impl, device: torch.device, max_num_reqs: int):
+    def __init__(self, impl, device: torch.device, max_num_reqs: int, attn_mask: torch.Tensor):
         adapter = FlashMLAAdapter.load(FlashMLAConfig(impl.num_heads, impl.scale))
         self.adapters = {True: adapter, False: replace(adapter, config=replace(adapter.config, mask_mode=0))}
         self.device = device
@@ -48,9 +47,7 @@ class FlashMLAMetadataBuilder:
         self.use_rope = impl.use_mla_rope
         self.max_num_reqs = max_num_reqs
         self.buffers: dict[tuple, FlashMLADecode] = {}
-        self.attn_mask = torch.triu(
-            torch.ones((FLASHMLA_MASK_SIZE, FLASHMLA_MASK_SIZE), dtype=torch.int8, device=device), diagonal=1
-        )
+        self.attn_mask = attn_mask
         self.defer = False
         self.executor: DeviceMetadataExecutor | None = None
         self.tasks: tuple[DeviceMetadataTask, ...] = ()

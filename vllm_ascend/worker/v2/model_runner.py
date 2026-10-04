@@ -460,11 +460,6 @@ class NPUModelRunner(GPUModelRunner):
                     int(batch_state.num_scheduled_tokens.max()),
                     batch_state.has_prefill,
                 )
-        # Memory profiling runs before initialize_kv_cache creates the manager.
-        if self.cudagraph_manager is not None:
-            self.cudagraph_manager.flashmla_has_prefill = bool(
-                ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA and batch_state is not None and batch_state.has_prefill
-            )
         if ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA and batch_state is not None:
             # Reorder every per-request field before positions, slots, tables
             # and sampling indices are constructed. A short prompt is prefill.

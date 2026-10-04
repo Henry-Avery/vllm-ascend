@@ -18,7 +18,6 @@
 #
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import replace
 from functools import partial
 from typing import Any
 
@@ -164,7 +163,6 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         )
         self.breakable_cg_runner: BreakableACLGraphWrapper | None = None
         self.model_runner = model_runner
-        self.flashmla_has_prefill = False
         self.update_stream = self.model_runner.update_stream
         self.capture_sizes = collect_sorted_captured_token_sizes(self._capture_descs)
         if super().needs_capture():
@@ -173,14 +171,6 @@ class ModelAclGraphManager(ModelCudaGraphManager):
     def init_breakable_cg_runner(self, model: nn.Module) -> None:
         if self.breakable_cg_runner is None:
             self.breakable_cg_runner = BreakableACLGraphWrapper(model, self.vllm_config)
-
-    def dispatch(self, num_reqs: int, num_tokens: int, *args, **kwargs) -> BatchExecutionDescriptor:
-        desc = super().dispatch(num_reqs, num_tokens, *args, **kwargs)
-        if self.flashmla_has_prefill and desc.cg_mode == CUDAGraphMode.FULL:
-            # A short prompt suffix can match a decode graph by length. Its
-            # captured FlashMLA operations cannot execute the FIA prefill path.
-            return replace(desc, cg_mode=CUDAGraphMode.NONE, num_tokens=num_tokens, num_reqs=num_reqs)
-        return desc
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""

@@ -77,7 +77,7 @@ def test_target_support_gate_rejects_unwired_modes(change, message):
         "_validate_external_flashmla",
         dict(
             torch=torch,
-            FLASHMLA_QUERY_HEADS=(8, 12, 64, 96),
+            MLA_FLASH_SUPPORTED_Q_HEADS=(8, 12, 64, 96),
             FLASHMLA_QK_DIM=576,
             FLASHMLA_V_DIM=512,
             get_current_hardware_profile=lambda: SimpleNamespace(supports=lambda _: True),

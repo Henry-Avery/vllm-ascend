@@ -8,6 +8,7 @@ are loaded from production source. NPU stream fences and numerical attention
 still require the release machine.
 """
 
+import ast
 import runpy
 import sys
 from pathlib import Path
@@ -35,6 +36,19 @@ def runtime(monkeypatch):
         "vllm.forward_context", BatchDescriptor=object, get_forward_context=Mock(), is_forward_context_available=Mock()
     )
     install("vllm_ascend")
+    tree = ast.parse((root / "vllm_ascend/attention/utils.py").read_text())
+    node = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "MLA_FLASH_SUPPORTED_Q_HEADS" for t in n.targets)
+    )
+    utils = install("vllm_ascend.attention.utils")
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "<capability>", "exec"), utils.__dict__)
+    install("vllm_ascend.platform", ModelConfig=object)
+    install("vllm_ascend.utils", singleton=lambda cls: cls)
+    mask_module = load("flashmla_mask_under_test", "vllm_ascend/attention/attention_mask.py")
+    masks = mask_module.AttentionMaskBuilder(torch.device("cpu"))
     adapter_module = load("vllm_ascend.attention.flashmla", "vllm_ascend/attention/flashmla.py")
     task_module = load("vllm_ascend.worker.device_metadata", "vllm_ascend/worker/device_metadata.py")
 
@@ -59,9 +73,11 @@ def runtime(monkeypatch):
 
     def builder():
         impl = SimpleNamespace(num_heads=64, scale=0.125, dtype=torch.bfloat16, use_mla_rope=True)
-        return module.FlashMLAMetadataBuilder(impl, torch.device("cpu"), max_num_reqs=4)
+        return module.FlashMLAMetadataBuilder(
+            impl, torch.device("cpu"), max_num_reqs=4, attn_mask=masks.get_splitfuse_attn_mask()
+        )
 
-    return SimpleNamespace(builder=builder, metadata=metadata, stage=task_module.DeviceMetadataStage)
+    return SimpleNamespace(builder=builder, metadata=metadata, stage=task_module.DeviceMetadataStage, masks=masks)
 
 
 def common(lengths, boundaries, *, tokens=4, slots=None, positions=None, blocks=None):
@@ -202,3 +218,12 @@ def test_only_explicit_graph_shapes_are_retained_and_reused_by_eager(runtime):
             assert flash.cache_lens.tolist() == [30, 0, 0, 0, 0]
         else:
             assert flash is not captured
+
+
+def test_builders_share_existing_causal_mask_without_copying_or_mutating(runtime):
+    mask = runtime.masks.get_splitfuse_attn_mask()
+    original = mask.clone()
+    first = runtime.builder().build(common([9], [0, 1]), 1, 1, False)
+    second = runtime.builder().build(common([13], [0, 1]), 1, 1, False)
+    assert first.attn_mask is second.attn_mask is mask
+    assert torch.equal(mask, original)

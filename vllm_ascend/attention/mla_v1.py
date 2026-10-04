@@ -33,12 +33,12 @@ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.flashmla import (
     FLASHMLA_QK_DIM,
-    FLASHMLA_QUERY_HEADS,
     FLASHMLA_V_DIM,
     split_flashmla_requests,
 )
 from vllm_ascend.attention.flashmla_metadata import FlashMLADecode, FlashMLAMetadataBuilder
 from vllm_ascend.attention.utils import (
+    MLA_FLASH_SUPPORTED_Q_HEADS,
     MLAPO_MAX_SUPPORTED_TOKENS,
     AscendCommonAttentionMetadata,
     PreprocessType,
@@ -345,15 +345,9 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         self.flashmla_state = None
         if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
             impl = static_forward_context[layer_names[0]].impl
-            self.flashmla_state = FlashMLAMetadataBuilder(impl, device, scheduler_config.max_num_seqs)
-
-    @property
-    def uses_device_metadata(self) -> bool:
-        return self.flashmla_state is not None
-
-    def enable_device_metadata(self) -> None:
-        if self.flashmla_state is not None:
-            self.flashmla_state.defer = True
+            self.flashmla_state = FlashMLAMetadataBuilder(
+                impl, device, scheduler_config.max_num_seqs, self.attn_mask_builder.get_splitfuse_attn_mask()
+            )
 
     def take_device_metadata_tasks(self):
         return self.flashmla_state.take_tasks() if self.flashmla_state is not None else ()
@@ -990,8 +984,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.mlapo_num_heads = self.num_heads
         self.mlapo_weight_quant_mode = 3
         self._mlapo_uses_native_weights = False
-        self.external_flashmla_enabled = envs.VLLM_ASCEND_ENABLE_FLASH_MLA
-        if self.external_flashmla_enabled:
+        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
             self._validate_external_flashmla()
 
     def _validate_external_flashmla(self) -> None:
@@ -1002,8 +995,10 @@ class AscendMLAImpl(MLAAttentionImpl):
             raise ValueError("External FlashMLA speculative decoding integration is separate")
         if not get_current_hardware_profile().supports(HardwareCapability.MLA_FLASH):
             raise ValueError("External FlashMLA requires an Ascend MLA_FLASH-capable device")
-        if self.num_heads not in FLASHMLA_QUERY_HEADS or self.num_kv_heads != 1:
-            raise ValueError(f"External FlashMLA requires local Q heads in {FLASHMLA_QUERY_HEADS} and one KV head")
+        if self.num_heads not in MLA_FLASH_SUPPORTED_Q_HEADS or self.num_kv_heads != 1:
+            raise ValueError(
+                f"External FlashMLA requires local Q heads in {MLA_FLASH_SUPPORTED_Q_HEADS} and one KV head"
+            )
         if self.kv_lora_rank != FLASHMLA_V_DIM or self.qk_rope_head_dim != FLASHMLA_QK_DIM - FLASHMLA_V_DIM:
             raise ValueError("External FlashMLA requires latent512 + positional64 inputs")
         if self.fa_quant_layer or self.dtype not in (torch.bfloat16, torch.float16) or self.enable_kv_nz:
@@ -1032,12 +1027,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             # layers in the same metadata dict, but only MLA layers contribute a
             # captured FIA op, so zipping unfiltered keys against attn_params
             # pairs MLA params with KDA layer names.
-            attn_keys = [
-                k
-                for k in attn_metadata[0]
-                if getattr(attn_metadata[0][k], "decode", None) is not None
-                and getattr(attn_metadata[0][k], "external_flashmla", None) is None
-            ]
+            attn_keys = [k for k in attn_metadata[0] if getattr(attn_metadata[0][k], "decode", None) is not None]
         else:
             graph_params = get_graph_params()
             attn_metadata = forward_context.attn_metadata
