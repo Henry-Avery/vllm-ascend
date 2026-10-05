@@ -5678,7 +5678,7 @@ class NPUModelRunner(GPUModelRunner):
                         )
                         if (
                             get_current_hardware_profile().supports(HardwareCapability.MLA_FLASH)
-                            and current_kv_cache_spec.num_heads in MLA_FLASH_SUPPORTED_Q_HEADS
+                            and current_kv_cache_spec.num_query_heads in MLA_FLASH_SUPPORTED_Q_HEADS
                             and get_flashmla_ops() is not None
                         ):
                             # A5 interleaves [NoPE | RoPE] per token in every
@@ -6326,6 +6326,7 @@ class NPUModelRunner(GPUModelRunner):
                     indexes_kv_by_block_stride = bool(getattr(attn_module, "indexes_kv_by_block_stride", False))
                     kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
                         block_size=self.block_size,
+                        num_query_heads=attn_module.num_heads,
                         num_kv_heads=1,
                         head_size=head_size,
                         dtype=dtype,
@@ -6359,13 +6360,8 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
                         block_size=spec.block_size,
-                        # Keep the physical MLA latent head count for Kimi K3;
-                        # query heads must not inflate the generic KV page shape.
-                        num_heads=(
-                            spec.num_heads
-                            if getattr(self.model_config.hf_text_config, "model_type", None) == "kimi_linear"
-                            else attn_module.num_heads
-                        ),
+                        num_heads=spec.num_heads,
+                        num_query_heads=attn_module.num_heads,
                         num_kv_heads=spec.num_kv_heads,
                         head_size=head_size,
                         dtype=dtype,
