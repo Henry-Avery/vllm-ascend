@@ -28,6 +28,8 @@ class _BackendA:
 def _speculator(**attributes):
     speculator = AscendDSparkSpeculator.__new__(AscendDSparkSpeculator)
     speculator.attn_architecture = None
+    speculator.use_dcp = False
+    speculator.flashmla_executor = None
     for name, value in attributes.items():
         setattr(speculator, name, value)
     return speculator
@@ -68,6 +70,67 @@ def test_set_attn_preserves_cache_group_order(monkeypatch):
     assert list(speculator.attn_backends) == ["draft.2", "draft.0"]
     assert speculator._context_slot_mappings.dtype == torch.int32
     assert active_context == []
+
+
+@pytest.mark.parametrize(
+    "has_groups,dummy_run,is_profile,skip_attn,allowed",
+    [
+        (False, True, True, True, True),
+        (False, True, True, False, False),
+        (False, True, False, True, False),
+        (False, False, False, False, False),
+        (True, False, False, False, True),
+    ],
+)
+def test_propose_binds_draft_flashmla_groups_only_after_attention_init(
+    monkeypatch, has_groups, dummy_run, is_profile, skip_attn, allowed
+):
+    draft_config = SimpleNamespace(parallel_config=object())
+    executor = SimpleNamespace(submission_in_flight=False)
+    state = SimpleNamespace(executor=None, defer=False)
+    builder = SimpleNamespace(flashmla_state=state)
+    group = SimpleNamespace(get_metadata_builder=lambda _: builder)
+    groups = [[group]] if has_groups else None
+    observed = []
+    result = object()
+
+    def parent_propose(*args, **kwargs):
+        observed.append((state.executor, state.defer))
+        return result
+
+    monkeypatch.setattr(DSparkSpeculator, "propose", parent_propose)
+    monkeypatch.setattr(speculator_module, "build_attn_metadata_wrapper", nullcontext)
+    monkeypatch.setattr(speculator_module, "build_attn_metadata_factory", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(AscendDSparkSpeculator, "attn_vllm_config", property(lambda self: draft_config))
+    speculator = _speculator(
+        input_buffers=SimpleNamespace(positions=object()),
+        max_num_tokens=8,
+        flashmla_executor=executor,
+    )
+    if has_groups:
+        speculator.attn_groups = groups
+    input_batch = SimpleNamespace(is_prefilling_np=np.array([False]))
+
+    def propose():
+        return speculator.propose(
+            input_batch,
+            {},
+            {},
+            *([None] * 8),
+            dummy_run=dummy_run,
+            is_profile=is_profile,
+            skip_attn_for_dummy_run=skip_attn,
+        )
+
+    if allowed:
+        assert propose() is result
+        assert observed == ([(executor, True)] if has_groups else [(None, False)])
+        assert state.executor is None
+        assert state.defer is False
+    else:
+        with pytest.raises(RuntimeError, match="outside initial memory profiling"):
+            propose()
+        assert observed == []
 
 
 @pytest.mark.parametrize("architecture", ["GQA", "MLA"])

@@ -1179,7 +1179,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         num_blocks = 2
         spec = AscendMLAAttentionSpec(
             block_size=384,
-            num_heads=64,
+            num_query_heads=64,
             num_kv_heads=1,
             head_size=576,
             dtype=torch.bfloat16,
@@ -1210,7 +1210,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         flash_profile = SimpleNamespace(supports=lambda capability: capability is HardwareCapability.MLA_FLASH)
         for q_heads in (8, 12, 64, 96):
             with self.subTest(q_heads=q_heads):
-                spec = dataclasses_replace(spec, num_heads=q_heads)
+                spec = dataclasses_replace(spec, num_query_heads=q_heads)
                 with patch(
                     "vllm_ascend.worker.model_runner_v1.get_current_hardware_profile",
                     return_value=flash_profile,
@@ -1223,7 +1223,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         # A5 FlashMLA does not support arbitrary query-head counts. Keep these
         # models on the FIA-compatible component-major layout.
-        spec = dataclasses_replace(spec, num_heads=48)
+        spec = dataclasses_replace(spec, num_query_heads=48)
         with patch(
             "vllm_ascend.worker.model_runner_v1.get_current_hardware_profile",
             return_value=flash_profile,
@@ -1754,7 +1754,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertIsInstance(spec, AscendMLAAttentionSpec)
         self.assertEqual(spec.model_version, attn_module.model_version)
         self.assertTrue(spec.indexes_kv_by_block_stride)
-        self.assertEqual(spec.num_heads, 64)
+        self.assertEqual(spec.num_query_heads, 64)
+        self.assertEqual(spec.num_heads, 1)
 
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
