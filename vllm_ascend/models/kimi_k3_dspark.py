@@ -49,26 +49,17 @@ def _uses_causal_draft_attention(config) -> bool:
     return bool(getattr(config, "full_attention_causal", False))
 
 
-def _uses_prolog_v3_context_writer(kv_cache: object) -> bool:
-    """Whether a component-major cache needs the stride-aware PROLOG_V3 path."""
-    if not isinstance(kv_cache, tuple) or len(kv_cache) != 2:
-        return False
-    if not all(isinstance(cache, torch.Tensor) for cache in kv_cache):
-        return False
-
-    def first_axis_strided(cache: torch.Tensor) -> bool:
-        if cache.dim() != 4 or cache.is_contiguous():
-            return False
-        # PROLOG_V3 supports a non-contiguous first axis only. Fused
-        # token-interleaved views remain on their existing DSpark path.
+def _normalize_dspark_mla_cache(
+    kv_cache: object,
+    kv_lora_rank: int,
+) -> tuple[torch.Tensor, ...] | object:
+    """Expose the NoPE/RoPE logical views consumed by MLA writers."""
+    if isinstance(kv_cache, torch.Tensor):
         return (
-            cache.stride(3) == 1
-            and cache.stride(2) == cache.shape[3]
-            and cache.stride(1) == cache.shape[2] * cache.stride(2)
-            and cache.stride(0) != cache.shape[1] * cache.stride(1)
+            kv_cache[..., :kv_lora_rank],
+            kv_cache[..., kv_lora_rank:],
         )
-
-    return all(first_axis_strided(cache) for cache in kv_cache)
+    return kv_cache
 
 
 def _log_dspark_mla_cache_diagnostic(
@@ -304,13 +295,15 @@ class AscendK3DSparkModel(UpstreamK3DSparkModel):
             if slots is None:
                 continue
             kv_cache = attn.kv_cache
-            if _uses_prolog_v3_context_writer(kv_cache):
-                _log_dspark_mla_cache_diagnostic(layer_idx, kv_cache, kv_cache, slots)
+            assert attn.impl.kv_lora_rank is not None
+            normalized_cache = _normalize_dspark_mla_cache(kv_cache, attn.impl.kv_lora_rank)
+            if attn.impl._cache_requires_prolog_v3_writer(normalized_cache):
+                _log_dspark_mla_cache_diagnostic(layer_idx, kv_cache, normalized_cache, slots)
                 attn.impl.exec_context_kv_prolog_v3(
                     context_states,
                     cos,
                     sin,
-                    kv_cache,
+                    normalized_cache,
                     slots,
                 )
                 continue
@@ -319,9 +312,8 @@ class AscendK3DSparkModel(UpstreamK3DSparkModel):
             assert attn.q_lora_rank is not None
             qkv_lora = attn.fused_qkv_a_proj(context_states)[0]
             kv_no_split = qkv_lora[..., attn.q_lora_rank :].contiguous()
-            if isinstance(kv_cache, torch.Tensor):
-                # Context writes bypass MLA forward's fused-cache view split.
-                kv_cache = (kv_cache[..., : attn.impl.kv_lora_rank], kv_cache[..., attn.impl.kv_lora_rank :])
+            # Context writes bypass MLA forward's fused-cache view split.
+            kv_cache = normalized_cache
             _log_dspark_mla_cache_diagnostic(layer_idx, attn.kv_cache, kv_cache, slots)
             attn.impl.exec_kv_prefill(
                 kv_no_split,
