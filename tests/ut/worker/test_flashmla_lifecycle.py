@@ -170,6 +170,8 @@ def wrapper(binding):
         obj.kvpp = SimpleNamespace(complete_forward=Mock())
         obj._maybe_send_draft_kv = Mock()
         obj.use_dcp = False
+        obj.replicated_pcp = False
+        obj.enable_adaptive_verification = False
         obj.attn_architecture = None
         obj.input_buffers = SimpleNamespace(positions=None)
         obj.max_num_tokens = 32
@@ -298,3 +300,15 @@ def test_target_capture_keeps_dependency_cleanup(wrapper, fail):
     device_metadata.finish.assert_called_once()
     executor.release.assert_called_once()
     assert state.executor is None and not state.defer
+
+
+@pytest.mark.parametrize("replicated", [False, True])
+@pytest.mark.parametrize("adaptive", [False, True])
+@pytest.mark.parametrize("profile", [False, True])
+def test_draft_preserves_dependency_dp_coordination(wrapper, replicated, adaptive, profile):
+    obj = wrapper.make("Draft", None)
+    obj.replicated_pcp = replicated
+    obj.enable_adaptive_verification = adaptive
+    wrapper.call(obj, "Draft", is_profile=profile)
+    expected = None if replicated or (adaptive and not profile) else "target-dp"
+    assert obj.parent_call.call_args.args[11] == expected
