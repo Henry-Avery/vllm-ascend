@@ -120,19 +120,21 @@ def flashmla_metadata_scope(attn_groups, executor: DeviceMetadataExecutor | None
         yield
         return
     changed = []
-    for groups in attn_groups:
-        for group in groups:
-            state = getattr(group.get_metadata_builder(0), "flashmla_state", None)
-            if state is not None and state.executor is not executor:
-                changed.append((state, state.executor, state.defer))
-                state.executor, state.defer = executor, True
     try:
+        for groups in attn_groups:
+            for group in groups:
+                state = getattr(group.get_metadata_builder(0), "flashmla_state", None)
+                if state is not None and state.executor is not executor:
+                    changed.append((state, state.executor, state.defer))
+                    state.executor, state.defer = executor, True
         yield
     finally:
-        if changed and executor.submission_in_flight:
-            executor.release()
-        for state, previous_executor, previous_defer in changed:
-            state.executor, state.defer = previous_executor, previous_defer
+        try:
+            if changed and executor.submission_in_flight:
+                executor.release()
+        finally:
+            for state, previous_executor, previous_defer in changed:
+                state.executor, state.defer = previous_executor, previous_defer
 
 
 # MRV2's upstream _dummy_run drops runner-specific kwargs such as``skip_gdn_state_update``
@@ -289,7 +291,6 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             ratio_kwargs: dict[str, Any] = {"tokens_per_state": compression_ratio}
             spec = AscendMLAAttentionSpec(
                 block_size=spec.block_size,
-                num_heads=spec.num_heads,
                 num_query_heads=attn_module.num_heads,
                 num_kv_heads=spec.num_kv_heads,
                 head_size=head_size,

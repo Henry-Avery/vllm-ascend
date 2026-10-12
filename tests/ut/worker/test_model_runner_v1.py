@@ -1241,13 +1241,13 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         # A5 also falls back to FIA when the active CANN package does not
         # provide both FlashMLA APIs.
-        spec = replace(spec, num_heads=64)
+        spec = replace(spec, num_query_heads=64)
+        attn_module.impl.use_flashmla = False
         with (
             patch(
                 "vllm_ascend.worker.model_runner_v1.get_current_hardware_profile",
                 return_value=flash_profile,
             ),
-            patch("vllm_ascend.worker.model_runner_v1.get_flashmla_ops", return_value=None),
         ):
             missing_flashmla_ops = runner._reshape_kv_cache_tensors(kv_cache_config, {layer_name: (raw,)})[layer_name]
 

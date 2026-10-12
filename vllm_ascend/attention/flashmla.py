@@ -10,13 +10,10 @@ decode hot path must not copy lengths or block tables to the CPU.
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from importlib import import_module
-from importlib.util import find_spec
-from pathlib import Path
 
 import torch
 
-from vllm_ascend.attention.utils import MLA_FLASH_SUPPORTED_Q_HEADS
+from vllm_ascend.attention.utils import MLA_FLASH_SUPPORTED_Q_HEADS, get_flashmla_ops
 
 FLASHMLA_QK_DIM = 576
 FLASHMLA_V_DIM = 512
@@ -97,48 +94,6 @@ def _check_lengths(
         if seqused_q.device != cache_seqlens.device:
             raise ValueError("FlashMLA seqused_q must be on the same device as cache_seqlens")
     return batch_size
-
-
-def _has_flashmla_module() -> bool:
-    """Avoid importing every legacy CANN op when FlashMLA is absent.
-
-    The current operator package eagerly imports its legacy map, including
-    JIT extensions, from ``cann_ops_transformer.ops``. Both the external wheel
-    and the target CANN package use this module path for the required APIs.
-    """
-    spec = find_spec("cann_ops_transformer")
-    return bool(
-        spec
-        and spec.submodule_search_locations
-        and any(
-            (Path(root) / "ops/attention/flash_mla_with_kvcache/__init__.py").is_file()
-            for root in spec.submodule_search_locations
-        )
-    )
-
-
-def get_flashmla_ops() -> tuple[Callable, Callable] | None:
-    """Find the two FlashMLA APIs in the active CANN operator package.
-
-    An absent package or API permits FIA selection before KV cache allocation.
-    Import failures inside an installed package remain errors rather than
-    silently selecting a different cache layout.
-    """
-    if not _has_flashmla_module():
-        return None
-
-    try:
-        ops = import_module("cann_ops_transformer.ops")
-    except ModuleNotFoundError as exc:
-        if exc.name in ("cann_ops_transformer", "cann_ops_transformer.ops"):
-            return None
-        raise
-
-    attention_op = getattr(ops, "flash_mla_with_kvcache", None)
-    metadata_op = getattr(ops, "flash_mla_with_kvcache_metadata", None)
-    if callable(attention_op) and callable(metadata_op):
-        return attention_op, metadata_op
-    return None
 
 
 @dataclass(frozen=True)

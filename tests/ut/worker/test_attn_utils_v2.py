@@ -592,8 +592,9 @@ def test_v2_mla_single_raw_backing_selects_layout_by_resolved_backend(monkeypatc
 
     # Missing FlashMLA APIs in the active CANN package also select the
     # FIA-compatible component-major layout.
-    monkeypatch.setattr(attn_utils, "get_flashmla_ops", lambda: None)
-    spec = replace(spec, num_heads=64)
+    # Backend selection has already resolved missing operator APIs to FIA.
+    attn_module.impl.use_flashmla = False
+    spec = replace(spec, num_query_heads=64)
     missing_flashmla_ops = reshape()
     assert isinstance(missing_flashmla_ops, tuple)
 

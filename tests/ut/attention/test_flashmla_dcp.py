@@ -128,7 +128,7 @@ def runtime(monkeypatch):
         return install(name, **runpy.run_path(str(ROOT / relative)))
 
     install("vllm_ascend")
-    utils = install("vllm_ascend.attention.utils")
+    utils = install("vllm_ascend.attention.utils", get_flashmla_ops=lambda: None)
     tree = ast.parse((ROOT / "vllm_ascend/attention/utils.py").read_text(encoding="utf-8"))
     constant = next(
         node
@@ -194,9 +194,9 @@ def runtime(monkeypatch):
         "fused_dcp_lse_combine": combine_outputs,
         "AscendMLAMetadata": object,
         "AscendMLADCPDecodeMetadata": SimpleNamespace,
-        "MLASplitAttentionKind": AttentionKind,
+        "CPKVScope": AttentionKind,
         "_EXTRA_CTX": context,
-        "_dcp_mtp_comm_stream": lambda: attn_stream,
+        "cp_decode_comm_stream": lambda: attn_stream,
         "get_graph_params": Mock(side_effect=AssertionError("FlashMLA must not prepare FIA graph tasks")),
     }
     scope["torch_npu"]._npu_fused_infer_attention_score_get_max_workspace = Mock(
@@ -206,6 +206,13 @@ def runtime(monkeypatch):
         name: load_method("vllm_ascend/attention/context_parallel/mla_cp.py", "AscendMlaDCPImpl", name, scope)
         for name in ("_forward_external_flashmla", "_run_dcp_flashmla_attention", "_forward_decode_split_attention")
     }
+
+    methods.update(
+        {
+            name: load_method("vllm_ascend/attention/context_parallel/common_cp.py", "DCPImplMixin", name, scope)
+            for name in ("_local_decode_query", "_merge_dcp_attention_output")
+        }
+    )
 
     def bind(impl):
         for name, method in methods.items():
@@ -520,7 +527,7 @@ def test_shared_dcp_keeps_fia_stream_order_and_workspace(runtime, monkeypatch, w
     )
     history_output, history_lse = torch.ones(2, 4, 4), torch.zeros(2, 4, 1)
     current_output, current_lse = torch.full((2, 2, 4), 3.0), torch.zeros(2, 2, 1)
-    kinds = runtime.scope["MLASplitAttentionKind"]
+    kinds = runtime.scope["CPKVScope"]
 
     def attention(q, q_rope, k, k_rope, **kwargs):
         is_history = kwargs["attention_kind"] is kinds.HISTORY
@@ -692,12 +699,12 @@ def test_causal_target_and_noncausal_draft_do_not_share_schedules(runtime):
 
 
 def test_current_kv_requirement_uses_external_split_metadata(runtime):
-    scope = {"AscendMLAMetadata": object}
+    fallback = Mock(return_value=True)
+    scope = {"AscendMLAMetadata": object, "use_history_current_split_decode": fallback, "_EXTRA_CTX": runtime.context}
     requires = load_method(
         "vllm_ascend/attention/context_parallel/mla_cp.py", "AscendMlaDCPImpl", "_decode_requires_current_kv", scope
     )
-    fallback = Mock(return_value=True)
-    impl = SimpleNamespace(_use_history_current_split_decode=fallback)
+    impl = SimpleNamespace(speculative_config=None)
     for causal in (True, False):
         flash = runtime.builder().build(common([9], [2], causal=causal), 1, 2, False)
         assert requires(impl, SimpleNamespace(external_flashmla=flash)) is causal
