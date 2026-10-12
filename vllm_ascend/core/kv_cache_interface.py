@@ -123,7 +123,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     """
 
     # Per-rank query heads used only by FlashMLA layout selection. Keep the
-    # inherited num_heads property for the planner's physical KV head slots.
+    # inherited physical KV geometry independent of the query-head count.
     num_query_heads: int = 1
     scale_dim: int = 0
     scale_dtype: torch.dtype = torch.int8

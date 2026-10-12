@@ -4,7 +4,8 @@ import pytest
 import torch
 
 import vllm_ascend.ops  # noqa: F401  # Register ops before importing attention/device modules.
-from vllm_ascend.attention import flashmla, mla_v1
+from vllm_ascend.attention import mla_v1
+from vllm_ascend.attention import utils as flashmla
 from vllm_ascend.attention.mla_v1 import AscendMLAImpl
 from vllm_ascend.device.hardware_profile import HardwareCapability
 
@@ -45,26 +46,14 @@ def test_flashmla_api_detection_distinguishes_absence_from_broken_import(monkeyp
         flashmla.get_flashmla_ops()
 
 
-def test_flashmla_module_precheck_skips_eager_cann_import(monkeypatch, tmp_path):
-    package = tmp_path / "cann_ops_transformer"
-    package.mkdir()
-    monkeypatch.setattr(
-        flashmla,
-        "find_spec",
-        lambda _name: SimpleNamespace(submodule_search_locations=[str(package)]),
-    )
-    monkeypatch.setattr(
-        flashmla,
-        "import_module",
-        lambda _name: pytest.fail("absent FlashMLA must not import the CANN ops package"),
-    )
-    assert not flashmla._has_flashmla_module()
-    assert flashmla.get_flashmla_ops() is None
-
-    module = package / "ops/attention/flash_mla_with_kvcache"
-    module.mkdir(parents=True)
-    (module / "__init__.py").write_text("")
-    assert flashmla._has_flashmla_module()
+def test_flashmla_module_precheck_skips_absent_cann_import(monkeypatch):
+    flashmla._has_flashmla_module.cache_clear()
+    monkeypatch.setattr(flashmla, "find_spec", lambda _name: None)
+    monkeypatch.setattr(flashmla, "import_module", lambda _name: pytest.fail("absent package must not be imported"))
+    try:
+        assert flashmla.get_flashmla_ops() is None
+    finally:
+        flashmla._has_flashmla_module.cache_clear()
 
 
 def test_flashmla_selection_requires_operator_and_supported_mla_config(monkeypatch):

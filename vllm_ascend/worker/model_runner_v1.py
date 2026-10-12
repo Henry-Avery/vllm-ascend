@@ -6354,8 +6354,7 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
                         block_size=spec.block_size,
-                        num_heads=spec.num_heads,
-                        num_query_heads=attn_module.num_heads,
+                                num_query_heads=attn_module.num_heads,
                         num_kv_heads=spec.num_kv_heads,
                         head_size=head_size,
                         dtype=dtype,
