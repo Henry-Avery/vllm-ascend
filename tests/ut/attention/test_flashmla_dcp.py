@@ -634,9 +634,9 @@ def test_external_dcp_graph_skips_fia_parameter_updates(draft):
 
 
 @pytest.mark.parametrize(
-    "heads,size,expected", [(8, 1, True), (8, 8, True), (12, 8, True), (8, 2, False), (12, 4, False)]
+    "heads,size,expected", [(8, 1, True), (12, 1, True), (8, 8, False), (12, 8, False), (8, 2, False), (12, 4, False)]
 )
-def test_selection_checks_both_local_and_gathered_heads(runtime, heads, size, expected):
+def test_selection_respects_dependency_dcp_allocation_boundary(runtime, heads, size, expected):
     scope = {
         "torch": torch,
         "HardwareCapability": SimpleNamespace(MLA_FLASH="mla"),
@@ -645,6 +645,7 @@ def test_selection_checks_both_local_and_gathered_heads(runtime, heads, size, ex
         "FLASHMLA_V_DIM": 512,
         "FLASHMLA_QK_DIM": 576,
         "supports_component_major_mla_pd": lambda _: True,
+        "pd_uses_component_major_mla_wire_layout": lambda _: False,
         "enable_sfa": lambda _: False,
         "get_flashmla_ops": lambda: (Mock(), Mock()),
     }
@@ -658,6 +659,8 @@ def test_selection_checks_both_local_and_gathered_heads(runtime, heads, size, ex
         dtype=torch.bfloat16,
         enable_kv_nz=False,
         pcp_enabled=False,
+        supports_prolog_v3_quantization=lambda: True,
+        q_proj=SimpleNamespace(_chunk_size=0),
         vllm_config=SimpleNamespace(
             use_v2_model_runner=True,
             speculative_config=None,

@@ -601,7 +601,7 @@ def test_v2_mla_single_raw_backing_selects_layout_by_resolved_backend(monkeypatc
     # Raw MooncakeV2 slots carry no physical-layout metadata. All PD endpoints
     # therefore use component-major storage, even when local FlashMLA support
     # would otherwise select token-fused.
-    monkeypatch.setattr(attn_utils, "get_flashmla_ops", lambda: (MagicMock(), MagicMock()))
+    attn_module.impl.use_flashmla = True
     vllm_config.kv_transfer_config = SimpleNamespace(
         kv_connector="MooncakeConnectorV2",
         kv_connector_module_path=None,
@@ -621,6 +621,7 @@ def test_v2_mla_single_raw_backing_selects_layout_by_resolved_backend(monkeypatc
     equal_pd_cache = reshape()
     assert isinstance(equal_pd_cache, tuple)
     vllm_config.kv_transfer_config = None
+    attn_module.impl.use_flashmla = False
 
     monkeypatch.setattr(attn_utils, "get_current_hardware_profile", lambda: component_profile)
     cache = reshape()

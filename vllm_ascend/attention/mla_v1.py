@@ -61,7 +61,11 @@ from vllm_ascend.compilation.acl_graph import (
     update_draft_graph_params_workspaces,
     update_graph_params_workspaces,
 )
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, supports_component_major_mla_pd
+from vllm_ascend.core.kv_cache_interface import (
+    AscendMLAAttentionSpec,
+    pd_uses_component_major_mla_wire_layout,
+    supports_component_major_mla_pd,
+)
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
@@ -1044,8 +1048,15 @@ class AscendMLAImpl(MLAAttentionImpl):
         if self.fa_quant_layer or self.dtype not in (torch.bfloat16, torch.float16) or self.enable_kv_nz:
             return False
         dcp_size = config.parallel_config.decode_context_parallel_size
-        # History sees all Q heads in the DCP group; current uses local heads.
-        if self.pcp_enabled or self.num_heads * dcp_size not in MLA_FLASH_SUPPORTED_Q_HEADS:
+        # The dependency keeps DCP on legacy split-cache allocation until
+        # its strided writer supports gathered Q and nonlocal current KV.
+        if self.pcp_enabled or dcp_size != 1:
+            return False
+        if not self.supports_prolog_v3_quantization() or getattr(self.q_proj, "_chunk_size", 0):
+            return False
+        # Raw PD transfers use component-major pages; the external reader
+        # requires the token-fused layout chosen by both cache allocators.
+        if pd_uses_component_major_mla_wire_layout(config):
             return False
         if not supports_component_major_mla_pd(config) or enable_sfa(config):
             return False

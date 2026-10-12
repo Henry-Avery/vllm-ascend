@@ -1256,7 +1256,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         # MooncakeV2 transfers raw physical slots without layout metadata, so
         # every PD endpoint uses the common component-major wire layout even
         # when local FlashMLA support would otherwise select token-fused.
-        spec = replace(spec, num_heads=64)
+        spec = replace(spec, num_query_heads=64)
+        attn_module.impl.use_flashmla = True
         runner.vllm_config.kv_transfer_config = SimpleNamespace(
             kv_connector="MooncakeConnectorV2",
             kv_connector_module_path=None,
@@ -1269,10 +1270,6 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             patch(
                 "vllm_ascend.worker.model_runner_v1.get_current_hardware_profile",
                 return_value=flash_profile,
-            ),
-            patch(
-                "vllm_ascend.worker.model_runner_v1.get_flashmla_ops",
-                return_value=(MagicMock(), MagicMock()),
             ),
         ):
             unequal_pd_cache = runner._reshape_kv_cache_tensors(kv_cache_config, {layer_name: (raw,)})[layer_name]
@@ -1289,15 +1286,12 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
                 "vllm_ascend.worker.model_runner_v1.get_current_hardware_profile",
                 return_value=flash_profile,
             ),
-            patch(
-                "vllm_ascend.worker.model_runner_v1.get_flashmla_ops",
-                return_value=(MagicMock(), MagicMock()),
-            ),
         ):
             equal_pd_cache = runner._reshape_kv_cache_tensors(kv_cache_config, {layer_name: (raw,)})[layer_name]
 
         self.assertIsInstance(equal_pd_cache, tuple)
         runner.vllm_config.kv_transfer_config = None
+        attn_module.impl.use_flashmla = False
 
         with patch(
             "vllm_ascend.worker.model_runner_v1.get_current_hardware_profile",
@@ -1317,7 +1311,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         layer_name = "model.layers.0.self_attn.attn"
         spec = AscendMLAAttentionSpec(
             block_size=384,
-            num_heads=64,
+            num_query_heads=64,
             num_kv_heads=1,
             head_size=576,
             dtype=torch.bfloat16,

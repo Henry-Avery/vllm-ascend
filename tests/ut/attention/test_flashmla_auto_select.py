@@ -60,6 +60,7 @@ def test_flashmla_selection_requires_operator_and_supported_mla_config(monkeypat
     config = SimpleNamespace(
         use_v2_model_runner=True,
         speculative_config=None,
+        kv_transfer_config=None,
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
     )
     impl = SimpleNamespace(
@@ -72,6 +73,8 @@ def test_flashmla_selection_requires_operator_and_supported_mla_config(monkeypat
         dtype=torch.bfloat16,
         enable_kv_nz=False,
         pcp_enabled=False,
+        supports_prolog_v3_quantization=lambda: True,
+        q_proj=SimpleNamespace(_chunk_size=0),
     )
     monkeypatch.setattr(
         mla_v1,
@@ -100,8 +103,8 @@ def test_flashmla_selection_requires_operator_and_supported_mla_config(monkeypat
     assert not AscendMLAImpl._can_use_flashmla(impl)
 
     config.parallel_config.decode_context_parallel_size = 8
-    assert AscendMLAImpl._can_use_flashmla(impl)
+    assert not AscendMLAImpl._can_use_flashmla(impl)
     impl.num_heads = 12
-    assert AscendMLAImpl._can_use_flashmla(impl)
+    assert not AscendMLAImpl._can_use_flashmla(impl)
     config.parallel_config.decode_context_parallel_size = 4
     assert not AscendMLAImpl._can_use_flashmla(impl)

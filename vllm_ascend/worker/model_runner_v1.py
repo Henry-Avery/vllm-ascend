@@ -5813,7 +5813,9 @@ class NPUModelRunner(GPUModelRunner):
                             kernel_block_size,
                             current_kv_cache_spec.num_kv_heads,
                         )
-                        if attn_module.impl.use_flashmla and not pd_uses_component_major_mla_wire_layout(self.vllm_config):
+                        if attn_module.impl.use_flashmla and not pd_uses_component_major_mla_wire_layout(
+                            self.vllm_config
+                        ):
                             # A5 interleaves [NoPE | RoPE] per token in every
                             # kernel slot: token0[NoPE|RoPE], token1[...], ...
                             fused_cache = make_page_strided_cache_view(
@@ -6493,7 +6495,7 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
                         block_size=spec.block_size,
-                                num_query_heads=attn_module.num_heads,
+                        num_query_heads=attn_module.num_heads,
                         num_kv_heads=spec.num_kv_heads,
                         head_size=head_size,
                         dtype=dtype,
