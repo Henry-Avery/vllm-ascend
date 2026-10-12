@@ -2,7 +2,7 @@ import ast
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 import numpy as np
 import pytest
@@ -13,6 +13,7 @@ from vllm.v1.worker.gpu import model_runner as vllm_model_runner
 from vllm.v1.worker.gpu.model_runner import BatchReqState, GPUModelRunner
 
 from vllm_ascend.ascend_forward_context import MoECommType
+from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
@@ -24,7 +25,8 @@ def _make_runner(need_timing: bool = True):
         scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(need_timing=need_timing)),
         sparse_kv_offload_config=SimpleNamespace(enabled=False),
     )
-    runner.vllm_config = SimpleNamespace()
+    runner.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(prefill_context_parallel_size=1))
+    runner.max_num_tokens = 16
     runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="other_model"))
     runner.kv_cache_config = KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
     runner.kvpp = SimpleNamespace(complete_forward=lambda: None)
@@ -364,9 +366,8 @@ def test_sample_tokens_restores_replicated_draft_hidden_states():
     runner.use_spec_pp = False
 
     hidden_states = torch.arange(6, dtype=torch.float32).reshape(2, 3)
-    # aux_hidden_states are restored by upstream sample_tokens (#56107);
-    # the Ascend pre-restore only covers the target hidden states.
-    state = Mock(aux_hidden_states=[torch.ones(2, 3)])
+    aux_hidden_states = torch.ones(2, 3)
+    state = Mock(aux_hidden_states=[aux_hidden_states])
     state.hidden_states = hidden_states
     restored_state = object()
     state._replace.return_value = restored_state
@@ -396,8 +397,23 @@ def test_sample_tokens_restores_replicated_draft_hidden_states():
     assert actual is expected_output
     parent_sample_tokens.assert_called_once_with(grammar_output)
     runner.pcp_manager.restore_hidden_state_buffer.assert_called_once_with(target_hidden_states)
-    runner.pcp_manager.restore_hidden_states.assert_called_once_with(hidden_states)
-    state._replace.assert_called_once_with(hidden_states=restored_hidden_states)
+    if vllm_version_is("0.30.0"):
+        # v0.30.0 restores aux outside restore_for_sampling, so the Ascend
+        # pre-restore only covers the target hidden states.
+        runner.pcp_manager.restore_hidden_states.assert_called_once_with(hidden_states)
+        state._replace.assert_called_once_with(hidden_states=restored_hidden_states)
+    else:
+        # vLLM main (#57980) folded the aux restore into restore_for_sampling,
+        # which the replicated-PCP fast path bypasses; the pre-restore must
+        # cover aux too or the draft reads PCP-local rows.
+        assert runner.pcp_manager.restore_hidden_states.call_args_list == [
+            call(hidden_states),
+            call(aux_hidden_states),
+        ]
+        state._replace.assert_called_once_with(
+            hidden_states=restored_hidden_states,
+            aux_hidden_states=[restored_hidden_states],
+        )
     assert runner.execute_model_state is restored_state
 
 
@@ -511,7 +527,12 @@ def test_kvpp_history_ignores_padding_and_dummy_work(monkeypatch, computed, dumm
     )
     state = default.AscendModelState.__new__(default.AscendModelState)
     state.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(prefill_context_parallel_size=1))
-    state.max_model_len = 32
+    # vLLM main (#58149) made max_model_len a read-only property backed by
+    # model_config; v0.30.0 keeps the plain instance attribute.
+    if vllm_version_is("0.30.0"):
+        state.max_model_len = 32
+    else:
+        state.model_config = SimpleNamespace(max_model_len=32)
     state.kvpp_runtime = runner.kvpp
     runner.model_state = state
     batch = SimpleNamespace(
@@ -844,7 +865,7 @@ def test_initialize_kv_cache_forwards_allocation_context():
 def test_profile_run_dummy_reserves_mc2(moe_type):
     runner = _make_runner()
     runner.max_num_tokens = 16
-    runner.vllm_config = SimpleNamespace()
+    runner.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(prefill_context_parallel_size=1))
     runner.get_model = MagicMock(return_value="m")
     runner._dummy_run = MagicMock()
     with (
@@ -870,6 +891,44 @@ def test_profile_run_skips_mc2_dummy_without_capacity():
     ):
         runner.profile_run()
     runner._dummy_run.assert_not_called()
+
+
+@pytest.mark.parametrize(("pcp_size", "tokens", "expected"), [(1, 16384, 16384), (16, 16384, 1024), (4, 17, 5)])
+@pytest.mark.parametrize("fail", [False, True])
+def test_profile_run_uses_pcp_local_tokens_and_restores_budget(pcp_size, tokens, expected, fail):
+    runner = _make_runner()
+    runner.vllm_config.parallel_config.prefill_context_parallel_size = pcp_size
+    runner.max_num_tokens = tokens
+
+    def parent_profile(self):
+        assert self.max_num_tokens == expected
+        if fail:
+            raise RuntimeError("profile failed")
+
+    with (
+        patch("vllm_ascend.worker.v2.model_runner.get_mc2_tokens_capacity", return_value=None),
+        patch.object(GPUModelRunner, "profile_run", parent_profile),
+    ):
+        if fail:
+            with pytest.raises(RuntimeError, match="profile failed"):
+                runner.profile_run()
+        else:
+            runner.profile_run()
+    assert runner.max_num_tokens == tokens
+
+
+def test_profile_run_compares_mc2_capacity_with_pcp_local_budget():
+    runner = _make_runner()
+    runner.max_num_tokens = 16384
+    runner.vllm_config.parallel_config.prefill_context_parallel_size = 16
+    runner._dummy_run = Mock()
+    with (
+        patch("vllm_ascend.worker.v2.model_runner.get_mc2_tokens_capacity", return_value=2048),
+        patch.object(GPUModelRunner, "profile_run"),
+    ):
+        runner.profile_run()
+    runner._dummy_run.assert_not_called()
+    assert runner.max_num_tokens == 16384
 
 
 def test_profile_run_reserves_sparse_offload_topk_buffers():
@@ -1050,7 +1109,10 @@ def _run_prepare_inputs(
         ),
         patch("vllm_ascend.worker.v2.model_runner.update_cos_sin"),
     ):
-        return runner.prepare_inputs(scheduler_output, batch_req_state, batch_desc), batch
+        # vLLM main (#56456) added num_active_loras to prepare_inputs.
+        if vllm_version_is("0.30.0"):
+            return runner.prepare_inputs(scheduler_output, batch_req_state, batch_desc), batch
+        return runner.prepare_inputs(scheduler_output, batch_req_state, batch_desc, 0), batch
 
 
 def test_prepare_inputs_common_path():

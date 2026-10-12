@@ -701,9 +701,13 @@ class NPUWorker(WorkerBase):
         has_mamba = any(isinstance(spec, MambaSpec) for spec in per_layer_specs)
         model_runner = getattr(self, "model_runner", None)
         layout = self.vllm_config.cache_config.get_resolved_kv_cache_layout()
+        # TODO: The Step-3.5/3.7 models will be sunset in the future. Once they
+        # are, remove this is_step_model exemption: this line and the
+        # `or is_step_model` budget gate below.
+        is_step_model = self.model_config.hf_text_config.model_type in ("step3p5", "step3p7")
         if (
             has_attention
-            and has_mamba
+            and (has_mamba or is_step_model)
             and layout.is_layer_compact
             and layout.is_block_compact
             and getattr(model_runner, "supports_standardized_shared_kv_backing", False)
@@ -1130,7 +1134,7 @@ class NPUWorker(WorkerBase):
             speculative_config = self.vllm_config.speculative_config
             if (
                 speculative_config is not None
-                and speculative_config.method == "dspark"
+                and speculative_config.use_eagle()
                 and any(isinstance(spec, SlidingWindowSpec) for spec in kv_cache_spec.values())
             ):
                 # Use the same full-allocation specs for KVPP budgeting and
